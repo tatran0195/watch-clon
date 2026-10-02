@@ -1,0 +1,61 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dto = { path = "../dto" }
+models = { path = "../models" }
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.8", features = [
+    "postgres",
+    "chrono",
+    "json",
+    "runtime-tokio",
+    "tls-native-tls",
+] }
+redis = { version = "0.29.5", features = [
+    "tokio-comp",
+    "tokio-native-tls-comp",
+] }
+handlebars = "6.2.0"
+rand = "0.9.0"
+regex = "1.10.2"
+argon2 = "0.5.3"
+totp-rs = "5.4.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "registry"] }
+tracing-opentelemetry = "0.32.0"
+opentelemetry = { version = "0.31", features = ["logs", "metrics"] }
+opentelemetry_sdk = { version = "0.31", features = ["trace", "logs", "metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "logs", "metrics", "http-proto", "reqwest-blocking-client"] }
+opentelemetry-appender-tracing = "0.31.1"
+base64 = "0.22.1"
+jsonwebtoken = "9.3"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+sonyflake = { version = "0.4", default-features = false }
+ipnetwork = "0.20"
+futures = "0.3"
+url = "2.5"
+reqwest = { version = "0.12", features = ["json"] }
+aws-config = "1.5.14"
+aws-sdk-s3 = "1.91.0"
+async-nats = "0.42.0"
+clickhouse = { version = "0.14.2", features = ["chrono", "native-tls"] }
+tiktoken-rs = "0.6.0"
+encoding_rs = "0.8"
+pgvector = { version = "0.4.1", features = ["sqlx", "serde", "halfvec"] }
+pulldown-cmark = "0.12.2"
+pdf-extract = "0.7.9"
+lopdf = "0.40.0"
+quick-xml = { version = "0.37.2", features = ["serialize"] }
+rust_decimal = "1.36"
+aes-gcm = "0.10"
+lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "smtp-transport", "builder"] }
+tokio = { version = "1", features = ["rt"] }
+wacht = { version = "0.1.0-beta.6" }

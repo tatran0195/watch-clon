@@ -1,0 +1,560 @@
+use axum::http::StatusCode;
+use commands::{
+    AddOrganizationMemberCommand, AddOrganizationMemberRoleCommand, AddWorkspaceMemberCommand,
+    AddWorkspaceMemberRoleCommand, CreateOrganizationRoleCommand, CreateWorkspaceRoleCommand,
+    DeleteOrganizationRoleCommand, DeleteWorkspaceRoleCommand, RemoveOrganizationMemberCommand,
+    RemoveOrganizationMemberRoleCommand, RemoveWorkspaceMemberCommand,
+    RemoveWorkspaceMemberRoleCommand, UpdateOrganizationMemberCommand,
+    UpdateOrganizationRoleCommand, UpdateWorkspaceMemberCommand, UpdateWorkspaceRoleCommand,
+};
+use common::db_router::ReadConsistency;
+use common::error::AppError;
+use dto::json::{
+    b2b::{
+        AddOrganizationMemberRequest, AddWorkspaceMemberRequest, CreateOrganizationRoleRequest,
+        CreateWorkspaceRoleRequest, UpdateOrganizationMemberRequest, UpdateOrganizationRoleRequest,
+        UpdateWorkspaceMemberRequest, UpdateWorkspaceRoleRequest,
+    },
+    nats::{
+        ApiKeyOrgMembershipSyncPayload, ApiKeyOrgRoleSyncPayload,
+        ApiKeyWorkspaceMembershipSyncPayload, ApiKeyWorkspaceRoleSyncPayload, NatsTaskMessage,
+    },
+};
+use models::{OrganizationMemberDetails, OrganizationRole, WorkspaceMemberDetails, WorkspaceRole};
+use queries::api_key::{
+    GetOrganizationMembershipIdsByRoleQuery, GetWorkspaceMembershipIdsByRoleQuery,
+};
+use serde::Serialize;
+use tracing::error;
+
+use crate::application::search_index::publish_search_user_sync;
+use crate::application::{AppState, response::ApiErrorResponse};
+use queries::{GetOrgMembershipUserIdQuery, GetWorkspaceMembershipUserIdQuery};
+
+/// Re-index the user behind an org membership after their membership/roles change.
+/// Best-effort: a stale search row must never fail the membership write.
+async fn reindex_org_member(app_state: &AppState, membership_id: i64) {
+    if let Ok(Some(user_id)) = GetOrgMembershipUserIdQuery::new(membership_id)
+        .execute_with_db(app_state.db_router.reader(ReadConsistency::Strong))
+        .await
+    {
+        publish_search_user_sync(app_state, user_id).await;
+    }
+}
+
+async fn reindex_ws_member(app_state: &AppState, membership_id: i64) {
+    if let Ok(Some(user_id)) = GetWorkspaceMembershipUserIdQuery::new(membership_id)
+        .execute_with_db(app_state.db_router.reader(ReadConsistency::Strong))
+        .await
+    {
+        publish_search_user_sync(app_state, user_id).await;
+    }
+}
+
+pub async fn add_organization_member(
+    app_state: &AppState,
+    deployment_id: i64,
+    organization_id: i64,
+    request: AddOrganizationMemberRequest,
+) -> Result<OrganizationMemberDetails, ApiErrorResponse> {
+    let member = AddOrganizationMemberCommand::new(
+        deployment_id,
+        organization_id,
+        request.user_id,
+        request.role_ids,
+    )
+    .with_membership_id(
+        app_state
+            .sf
+            .next_id()
+            .map_err(|e| AppError::Internal(e.to_string()))? as i64,
+    )
+    .execute_with_db(app_state.db_router.writer())
+    .await?;
+
+    publish_task(
+        app_state,
+        "worker.tasks.api_key.sync_org_membership_permissions",
+        "api_key.sync_org_membership_permissions",
+        format!("api-key-org-membership-{}", member.id),
+        ApiKeyOrgMembershipSyncPayload {
+            membership_id: member.id,
+        },
+    )
+    .await?;
+
+    reindex_org_member(app_state, member.id).await;
+    Ok(member)
+}
+
+pub async fn update_organization_member(
+    app_state: &AppState,
+    deployment_id: i64,
+    organization_id: i64,
+    membership_id: i64,
+    request: UpdateOrganizationMemberRequest,
+) -> Result<(), ApiErrorResponse> {
+    UpdateOrganizationMemberCommand {
+        deployment_id,
+        organization_id,
+        membership_id,
+        role_ids: request.role_ids,
+        public_metadata: request.public_metadata,
+    }
+    .execute_with_db(app_state.db_router.writer())
+    .await?;
+
+    publish_task(
+        app_state,
+        "worker.tasks.api_key.sync_org_membership_permissions",
+        "api_key.sync_org_membership_permissions",
+        format!("api-key-org-membership-{}", membership_id),
+        ApiKeyOrgMembershipSyncPayload { membership_id },
+    )
+    .await?;
+
+    reindex_org_member(app_state, membership_id).await;
+    Ok(())
+}
+
+pub async fn remove_organization_member(
+    app_state: &AppState,
+    deployment_id: i64,
+    organization_id: i64,
+    membership_id: i64,
+) -> Result<(), ApiErrorResponse> {
+    // Resolve the user before the membership row may be removed.
+    let user_id = GetOrgMembershipUserIdQuery::new(membership_id)
+        .execute_with_db(app_state.db_router.reader(ReadConsistency::Strong))
+        .await
+        .ok()
+        .flatten();
+
+    RemoveOrganizationMemberCommand {
+        deployment_id,
+        organization_id,
+        membership_id,
+    }
+    .execute_with_db(app_state.db_router.writer())
+    .await?;
+
+    if let Some(user_id) = user_id {
+        publish_search_user_sync(app_state, user_id).await;
+    }
+    Ok(())
+}
+
+pub async fn create_organization_role(
+    app_state: &AppState,
+    deployment_id: i64,
+    organization_id: i64,
+    request: CreateOrganizationRoleRequest,
+) -> Result<OrganizationRole, ApiErrorResponse> {
+    CreateOrganizationRoleCommand::new(
+        deployment_id,
+        organization_id,
+        request.name,
+        request.permissions,
+    )
+    .with_role_id(
+        app_state
+            .sf
+            .next_id()
+            .map_err(|e| AppError::Internal(e.to_string()))? as i64,
+    )
+    .execute_with_db(app_state.db_router.writer())
+    .await
+    .map_err(Into::into)
+}
+
+pub async fn update_organization_role(
+    app_state: &AppState,
+    deployment_id: i64,
+    organization_id: i64,
+    role_id: i64,
+    request: UpdateOrganizationRoleRequest,
+) -> Result<OrganizationRole, ApiErrorResponse> {
+    let role = UpdateOrganizationRoleCommand::new(
+        deployment_id,
+        organization_id,
+        role_id,
+        request.name,
+        request.permissions,
+    )
+    .execute_with_db(app_state.db_router.writer())
+    .await?;
+
+    publish_task(
+        app_state,
+        "worker.tasks.api_key.sync_org_role_permissions",
+        "api_key.sync_org_role_permissions",
+        format!("api-key-org-role-{}", role_id),
+        ApiKeyOrgRoleSyncPayload { role_id },
+    )
+    .await?;
+
+    Ok(role)
+}
+
+pub async fn delete_organization_role(
+    app_state: &AppState,
+    deployment_id: i64,
+    organization_id: i64,
+    role_id: i64,
+) -> Result<(), ApiErrorResponse> {
+    let reader = app_state.db_router.reader(ReadConsistency::Strong);
+    let membership_ids = GetOrganizationMembershipIdsByRoleQuery::new(role_id)
+        .execute_with_db(reader)
+        .await?;
+
+    DeleteOrganizationRoleCommand::new(deployment_id, organization_id, role_id)
+        .execute_with_db(app_state.db_router.writer())
+        .await?;
+
+    for membership_id in membership_ids {
+        publish_task(
+            app_state,
+            "worker.tasks.api_key.sync_org_membership_permissions",
+            "api_key.sync_org_membership_permissions",
+            format!("api-key-org-membership-{}", membership_id),
+            ApiKeyOrgMembershipSyncPayload { membership_id },
+        )
+        .await?;
+        reindex_org_member(app_state, membership_id).await;
+    }
+
+    Ok(())
+}
+
+pub async fn create_workspace_role(
+    app_state: &AppState,
+    deployment_id: i64,
+    workspace_id: i64,
+    request: CreateWorkspaceRoleRequest,
+) -> Result<WorkspaceRole, ApiErrorResponse> {
+    CreateWorkspaceRoleCommand::new(
+        deployment_id,
+        workspace_id,
+        request.name,
+        request.permissions,
+    )
+    .with_role_id(
+        app_state
+            .sf
+            .next_id()
+            .map_err(|e| AppError::Internal(e.to_string()))? as i64,
+    )
+    .execute_with_db(app_state.db_router.writer())
+    .await
+    .map_err(Into::into)
+}
+
+pub async fn update_workspace_role(
+    app_state: &AppState,
+    deployment_id: i64,
+    workspace_id: i64,
+    role_id: i64,
+    request: UpdateWorkspaceRoleRequest,
+) -> Result<WorkspaceRole, ApiErrorResponse> {
+    let role = UpdateWorkspaceRoleCommand::new(
+        deployment_id,
+        workspace_id,
+        role_id,
+        request.name,
+        request.permissions,
+    )
+    .execute_with_db(app_state.db_router.writer())
+    .await?;
+
+    publish_task(
+        app_state,
+        "worker.tasks.api_key.sync_workspace_role_permissions",
+        "api_key.sync_workspace_role_permissions",
+        format!("api-key-workspace-role-{}", role_id),
+        ApiKeyWorkspaceRoleSyncPayload { role_id },
+    )
+    .await?;
+
+    Ok(role)
+}
+
+pub async fn delete_workspace_role(
+    app_state: &AppState,
+    deployment_id: i64,
+    workspace_id: i64,
+    role_id: i64,
+) -> Result<(), ApiErrorResponse> {
+    let reader = app_state.db_router.reader(ReadConsistency::Strong);
+    let membership_ids = GetWorkspaceMembershipIdsByRoleQuery::new(role_id)
+        .execute_with_db(reader)
+        .await?;
+
+    DeleteWorkspaceRoleCommand::new(deployment_id, workspace_id, role_id)
+        .execute_with_db(app_state.db_router.writer())
+        .await?;
+
+    for membership_id in membership_ids {
+        publish_task(
+            app_state,
+            "worker.tasks.api_key.sync_workspace_membership_permissions",
+            "api_key.sync_workspace_membership_permissions",
+            format!("api-key-workspace-membership-{}", membership_id),
+            ApiKeyWorkspaceMembershipSyncPayload { membership_id },
+        )
+        .await?;
+        reindex_ws_member(app_state, membership_id).await;
+    }
+
+    Ok(())
+}
+
+pub async fn add_workspace_member(
+    app_state: &AppState,
+    deployment_id: i64,
+    workspace_id: i64,
+    request: AddWorkspaceMemberRequest,
+) -> Result<WorkspaceMemberDetails, ApiErrorResponse> {
+    let member = AddWorkspaceMemberCommand::new(
+        deployment_id,
+        workspace_id,
+        request.user_id,
+        request.role_ids,
+    )
+    .with_workspace_membership_id(
+        app_state
+            .sf
+            .next_id()
+            .map_err(|e| AppError::Internal(e.to_string()))? as i64,
+    )
+    .with_implicit_org_membership_id(
+        app_state
+            .sf
+            .next_id()
+            .map_err(|e| AppError::Internal(e.to_string()))? as i64,
+    )
+    .execute_with_db(app_state.db_router.writer())
+    .await?;
+
+    publish_task(
+        app_state,
+        "worker.tasks.api_key.sync_workspace_membership_permissions",
+        "api_key.sync_workspace_membership_permissions",
+        format!("api-key-workspace-membership-{}", member.id),
+        ApiKeyWorkspaceMembershipSyncPayload {
+            membership_id: member.id,
+        },
+    )
+    .await?;
+
+    reindex_ws_member(app_state, member.id).await;
+    Ok(member)
+}
+
+pub async fn update_workspace_member(
+    app_state: &AppState,
+    deployment_id: i64,
+    workspace_id: i64,
+    membership_id: i64,
+    request: UpdateWorkspaceMemberRequest,
+) -> Result<(), ApiErrorResponse> {
+    UpdateWorkspaceMemberCommand {
+        deployment_id,
+        workspace_id,
+        membership_id,
+        role_ids: request.role_ids,
+        public_metadata: request.public_metadata,
+    }
+    .execute_with_db(app_state.db_router.writer())
+    .await?;
+
+    publish_task(
+        app_state,
+        "worker.tasks.api_key.sync_workspace_membership_permissions",
+        "api_key.sync_workspace_membership_permissions",
+        format!("api-key-workspace-membership-{}", membership_id),
+        ApiKeyWorkspaceMembershipSyncPayload { membership_id },
+    )
+    .await?;
+
+    reindex_ws_member(app_state, membership_id).await;
+    Ok(())
+}
+
+pub async fn remove_workspace_member(
+    app_state: &AppState,
+    deployment_id: i64,
+    workspace_id: i64,
+    membership_id: i64,
+) -> Result<(), ApiErrorResponse> {
+    // Resolve the user before the membership row may be removed.
+    let user_id = GetWorkspaceMembershipUserIdQuery::new(membership_id)
+        .execute_with_db(app_state.db_router.reader(ReadConsistency::Strong))
+        .await
+        .ok()
+        .flatten();
+
+    RemoveWorkspaceMemberCommand {
+        deployment_id,
+        workspace_id,
+        membership_id,
+    }
+    .execute_with_db(app_state.db_router.writer())
+    .await?;
+
+    if let Some(user_id) = user_id {
+        publish_search_user_sync(app_state, user_id).await;
+    }
+    Ok(())
+}
+
+pub async fn add_organization_member_role(
+    app_state: &AppState,
+    deployment_id: i64,
+    organization_id: i64,
+    membership_id: i64,
+    role_id: i64,
+) -> Result<(), ApiErrorResponse> {
+    AddOrganizationMemberRoleCommand {
+        deployment_id,
+        organization_id,
+        membership_id,
+        role_id,
+    }
+    .execute_with_db(app_state.db_router.writer())
+    .await?;
+
+    publish_task(
+        app_state,
+        "worker.tasks.api_key.sync_org_membership_permissions",
+        "api_key.sync_org_membership_permissions",
+        format!("api-key-org-membership-{}", membership_id),
+        ApiKeyOrgMembershipSyncPayload { membership_id },
+    )
+    .await?;
+    reindex_org_member(app_state, membership_id).await;
+    Ok(())
+}
+
+pub async fn remove_organization_member_role(
+    app_state: &AppState,
+    deployment_id: i64,
+    organization_id: i64,
+    membership_id: i64,
+    role_id: i64,
+) -> Result<(), ApiErrorResponse> {
+    RemoveOrganizationMemberRoleCommand {
+        deployment_id,
+        organization_id,
+        membership_id,
+        role_id,
+    }
+    .execute_with_db(app_state.db_router.writer())
+    .await?;
+
+    publish_task(
+        app_state,
+        "worker.tasks.api_key.sync_org_membership_permissions",
+        "api_key.sync_org_membership_permissions",
+        format!("api-key-org-membership-{}", membership_id),
+        ApiKeyOrgMembershipSyncPayload { membership_id },
+    )
+    .await?;
+    reindex_org_member(app_state, membership_id).await;
+    Ok(())
+}
+
+pub async fn add_workspace_member_role(
+    app_state: &AppState,
+    deployment_id: i64,
+    workspace_id: i64,
+    membership_id: i64,
+    role_id: i64,
+) -> Result<(), ApiErrorResponse> {
+    AddWorkspaceMemberRoleCommand {
+        deployment_id,
+        workspace_id,
+        membership_id,
+        role_id,
+    }
+    .execute_with_db(app_state.db_router.writer())
+    .await?;
+
+    publish_task(
+        app_state,
+        "worker.tasks.api_key.sync_workspace_membership_permissions",
+        "api_key.sync_workspace_membership_permissions",
+        format!("api-key-workspace-membership-{}", membership_id),
+        ApiKeyWorkspaceMembershipSyncPayload { membership_id },
+    )
+    .await?;
+    reindex_ws_member(app_state, membership_id).await;
+    Ok(())
+}
+
+pub async fn remove_workspace_member_role(
+    app_state: &AppState,
+    deployment_id: i64,
+    workspace_id: i64,
+    membership_id: i64,
+    role_id: i64,
+) -> Result<(), ApiErrorResponse> {
+    RemoveWorkspaceMemberRoleCommand {
+        deployment_id,
+        workspace_id,
+        membership_id,
+        role_id,
+    }
+    .execute_with_db(app_state.db_router.writer())
+    .await?;
+
+    publish_task(
+        app_state,
+        "worker.tasks.api_key.sync_workspace_membership_permissions",
+        "api_key.sync_workspace_membership_permissions",
+        format!("api-key-workspace-membership-{}", membership_id),
+        ApiKeyWorkspaceMembershipSyncPayload { membership_id },
+    )
+    .await?;
+    reindex_ws_member(app_state, membership_id).await;
+    Ok(())
+}
+
+async fn publish_task<T>(
+    app_state: &AppState,
+    subject: &'static str,
+    task_type: &str,
+    task_id: String,
+    payload: T,
+) -> Result<(), ApiErrorResponse>
+where
+    T: Serialize,
+{
+    let task_message = NatsTaskMessage {
+        task_type: task_type.to_string(),
+        task_id: task_id.clone(),
+        payload: serde_json::to_value(payload)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+    };
+
+    app_state
+        .nats_client
+        .publish(
+            subject,
+            serde_json::to_vec(&task_message)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .into(),
+        )
+        .await
+        .map_err(|e| {
+            error!(
+                subject,
+                task_type,
+                task_id,
+                error = %e,
+                "Failed to publish background task"
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+
+    Ok(())
+}

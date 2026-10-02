@@ -1,0 +1,272 @@
+use chrono::Utc;
+use common::ResultExt;
+use common::{HasIdProvider, HasRedisProvider, error::AppError};
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SessionTicketType {
+    #[serde(rename = "impersonation")]
+    Impersonation,
+    #[serde(rename = "agent_access")]
+    AgentAccess,
+    #[serde(rename = "webhook_app_access")]
+    WebhookAppAccess,
+    #[serde(rename = "api_auth_access")]
+    ApiAuthAccess,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionIdentifier {
+    Static,
+    Signin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTicketPayload {
+    pub ticket_type: SessionTicketType,
+    pub deployment_id: String,
+    pub user_id: Option<String>,
+    pub actor_id: Option<String>,
+    pub agent_ids: Option<Vec<String>>,
+    pub agent_session_identifier: Option<AgentSessionIdentifier>,
+    pub webhook_app_slug: Option<String>,
+    pub api_auth_app_slug: Option<String>,
+    pub expires_at: i64,
+}
+
+pub struct GenerateSessionTicketCommand {
+    deployment_id: i64,
+    ticket_type: SessionTicketType,
+    user_id: Option<String>,
+    actor_id: Option<String>,
+    agent_ids: Option<Vec<String>>,
+    agent_session_identifier: Option<AgentSessionIdentifier>,
+    webhook_app_slug: Option<String>,
+    api_auth_app_slug: Option<String>,
+    expires_in: Option<u64>,
+}
+
+#[derive(Default)]
+pub struct GenerateSessionTicketCommandBuilder {
+    deployment_id: Option<i64>,
+    ticket_type: Option<SessionTicketType>,
+    user_id: Option<String>,
+    actor_id: Option<String>,
+    agent_ids: Option<Vec<String>>,
+    agent_session_identifier: Option<AgentSessionIdentifier>,
+    webhook_app_slug: Option<String>,
+    api_auth_app_slug: Option<String>,
+    expires_in: Option<u64>,
+}
+
+impl GenerateSessionTicketCommand {
+    pub fn builder() -> GenerateSessionTicketCommandBuilder {
+        GenerateSessionTicketCommandBuilder::default()
+    }
+
+    pub fn new(deployment_id: i64, ticket_type: SessionTicketType) -> Self {
+        Self {
+            deployment_id,
+            ticket_type,
+            user_id: None,
+            actor_id: None,
+            agent_ids: None,
+            agent_session_identifier: None,
+            webhook_app_slug: None,
+            api_auth_app_slug: None,
+            expires_in: None,
+        }
+    }
+
+    pub fn with_user_id(mut self, user_id: String) -> Self {
+        self.user_id = Some(user_id);
+        self
+    }
+
+    pub fn with_actor_id(mut self, actor_id: String) -> Self {
+        self.actor_id = Some(actor_id);
+        self
+    }
+
+    pub fn with_agent_ids(mut self, agent_ids: Vec<String>) -> Self {
+        self.agent_ids = Some(agent_ids);
+        self
+    }
+
+    pub fn with_agent_session_identifier(mut self, identifier: AgentSessionIdentifier) -> Self {
+        self.agent_session_identifier = Some(identifier);
+        self
+    }
+
+    pub fn with_webhook_app_slug(mut self, webhook_app_slug: String) -> Self {
+        self.webhook_app_slug = Some(webhook_app_slug);
+        self
+    }
+
+    pub fn with_api_auth_app_slug(mut self, api_auth_app_slug: String) -> Self {
+        self.api_auth_app_slug = Some(api_auth_app_slug);
+        self
+    }
+
+    pub fn with_expires_in(mut self, expires_in: u64) -> Self {
+        self.expires_in = Some(expires_in);
+        self
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct GenerateSessionTicketResponse {
+    pub ticket: String,
+    pub expires_at: i64,
+}
+
+impl GenerateSessionTicketCommand {
+    pub async fn execute_with_deps<D>(
+        self,
+        deps: &D,
+    ) -> Result<GenerateSessionTicketResponse, AppError>
+    where
+        D: HasRedisProvider + HasIdProvider,
+    {
+        let ticket_id = deps
+            .id_provider()
+            .next_id()
+            .map_err_internal("Failed to generate ticket ID")? as i64;
+        // Validate inputs based on ticket type
+        match self.ticket_type {
+            SessionTicketType::Impersonation => {
+                if self.user_id.is_none() {
+                    return Err(AppError::BadRequest(
+                        "user_id is required for impersonation tickets".to_string(),
+                    ));
+                }
+            }
+            SessionTicketType::AgentAccess => {
+                if self.agent_ids.as_ref().is_none_or(Vec::is_empty) {
+                    return Err(AppError::BadRequest(
+                        "agent_ids is required for agent_access tickets".to_string(),
+                    ));
+                }
+            }
+            SessionTicketType::WebhookAppAccess => {
+                if self.webhook_app_slug.as_deref().is_none_or(str::is_empty) {
+                    return Err(AppError::BadRequest(
+                        "webhook_app_slug is required for webhook_app_access tickets".to_string(),
+                    ));
+                }
+            }
+            SessionTicketType::ApiAuthAccess => {
+                if self.api_auth_app_slug.as_deref().is_none_or(str::is_empty) {
+                    return Err(AppError::BadRequest(
+                        "api_auth_app_slug is required for api_auth_access tickets".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // Generate ticket ID using Snowflake
+        let ticket = ticket_id.to_string();
+
+        // Calculate expiration
+        let ttl_seconds = self.expires_in.unwrap_or(43200); // Default 12 hours
+        let expires_at = Utc::now().timestamp() + ttl_seconds as i64;
+
+        // Create payload
+        let payload = SessionTicketPayload {
+            ticket_type: self.ticket_type.clone(),
+            deployment_id: self.deployment_id.to_string(),
+            user_id: self.user_id,
+            actor_id: self.actor_id,
+            agent_ids: self.agent_ids,
+            agent_session_identifier: self.agent_session_identifier,
+            webhook_app_slug: self.webhook_app_slug,
+            api_auth_app_slug: self.api_auth_app_slug,
+            expires_at,
+        };
+
+        // Serialize and store in Redis
+        let payload_json =
+            serde_json::to_string(&payload).map_err_internal("Failed to serialize ticket")?;
+
+        let redis_key = format!("session:ticket:{}", ticket);
+
+        let mut conn = deps
+            .redis_provider()
+            .get_multiplexed_async_connection()
+            .await
+            .map_err_internal("Failed to connect to Redis")?;
+
+        conn.set_ex::<_, _, ()>(&redis_key, &payload_json, ttl_seconds)
+            .await
+            .map_err_internal("Failed to store ticket in Redis")?;
+
+        Ok(GenerateSessionTicketResponse { ticket, expires_at })
+    }
+}
+
+impl GenerateSessionTicketCommandBuilder {
+    pub fn deployment_id(mut self, deployment_id: i64) -> Self {
+        self.deployment_id = Some(deployment_id);
+        self
+    }
+
+    pub fn ticket_type(mut self, ticket_type: SessionTicketType) -> Self {
+        self.ticket_type = Some(ticket_type);
+        self
+    }
+
+    pub fn user_id(mut self, user_id: String) -> Self {
+        self.user_id = Some(user_id);
+        self
+    }
+
+    pub fn actor_id(mut self, actor_id: String) -> Self {
+        self.actor_id = Some(actor_id);
+        self
+    }
+
+    pub fn agent_ids(mut self, agent_ids: Vec<String>) -> Self {
+        self.agent_ids = Some(agent_ids);
+        self
+    }
+
+    pub fn agent_session_identifier(mut self, identifier: AgentSessionIdentifier) -> Self {
+        self.agent_session_identifier = Some(identifier);
+        self
+    }
+
+    pub fn webhook_app_slug(mut self, webhook_app_slug: String) -> Self {
+        self.webhook_app_slug = Some(webhook_app_slug);
+        self
+    }
+
+    pub fn api_auth_app_slug(mut self, api_auth_app_slug: String) -> Self {
+        self.api_auth_app_slug = Some(api_auth_app_slug);
+        self
+    }
+
+    pub fn expires_in(mut self, expires_in: u64) -> Self {
+        self.expires_in = Some(expires_in);
+        self
+    }
+
+    pub fn build(self) -> Result<GenerateSessionTicketCommand, AppError> {
+        Ok(GenerateSessionTicketCommand {
+            deployment_id: self
+                .deployment_id
+                .ok_or_else(|| AppError::Validation("deployment_id is required".to_string()))?,
+            ticket_type: self
+                .ticket_type
+                .ok_or_else(|| AppError::Validation("ticket_type is required".to_string()))?,
+            user_id: self.user_id,
+            actor_id: self.actor_id,
+            agent_ids: self.agent_ids,
+            agent_session_identifier: self.agent_session_identifier,
+            webhook_app_slug: self.webhook_app_slug,
+            api_auth_app_slug: self.api_auth_app_slug,
+            expires_in: self.expires_in,
+        })
+    }
+}

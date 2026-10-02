@@ -1,0 +1,169 @@
+import {
+    IconDashboard,
+    IconSettings,
+    IconUsers,
+    IconKey,
+    IconBolt,
+    IconRobot,
+    IconLock,
+    IconBuilding,
+    IconCirclePlus,
+    IconCreditCard,
+    IconRocket,
+    IconShieldLock,
+} from "@tabler/icons-react";
+import { useLocation } from "react-router";
+import { NavMain } from "@/components/nav-main";
+import {
+    Sidebar,
+    SidebarContent,
+    SidebarHeader,
+    SidebarMenu,
+    SidebarMenuItem,
+} from "@/components/ui/sidebar";
+import { OrganizationSwitcher, useUser } from "@wacht/react-router";
+import { useProjects } from "@/lib/api/hooks/use-projects";
+
+export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
+    const { pathname } = useLocation();
+    const { selectedDeployment } = useProjects();
+    const { user } = useUser();
+    const hasNewUi = user?.segments?.some((s) => s.name === "new_ui") ?? false;
+    const isAuthRoute = /\/auth(?:\/|$)/.test(pathname);
+    const isOAuthRoute = /\/oauth(?:\/|$)/.test(pathname);
+    const isProductionDeployment = selectedDeployment?.mode === "production";
+    const isAgentsPlatformRoute = /\/llms(?:\/|$)/.test(pathname);
+
+    const navManagement = [
+        {
+            title: "Overview",
+            url: "./",
+            icon: IconDashboard,
+            isActive: pathname === "/" || pathname.endsWith("/"),
+        },
+        {
+            title: "Users",
+            url: "users/active",
+            icon: IconUsers,
+            isActive: pathname.includes("users"),
+        },
+        {
+            title: "Organizations",
+            url: "organizations",
+            icon: IconBuilding,
+            isActive: pathname.includes("organizations"),
+        },
+        {
+            title: "Segments",
+            url: "segments",
+            icon: IconCirclePlus,
+            isActive: pathname.includes("segments"),
+        },
+        ...(hasNewUi
+            ? [
+                  {
+                      title: "Access",
+                      url: "access",
+                      icon: IconShieldLock,
+                      isActive: pathname.includes("/access"),
+                  },
+              ]
+            : []),
+    ];
+
+    const navConfiguration = [
+        {
+            title: "Authentication",
+            url: "auth",
+            icon: IconLock,
+            isActive: isAuthRoute && !pathname.includes("auth-methods"),
+        },
+        {
+            title: "Multi Tenancy",
+            url: "b2b-settings",
+            icon: IconBuilding,
+            isActive: pathname.includes("b2b-settings"),
+        },
+        {
+            title: "OAuth Apps",
+            url: "oauth",
+            icon: IconKey,
+            isActive: isOAuthRoute,
+        },
+        {
+            title: "Manage Deployment",
+            url: "setup",
+            icon: IconSettings,
+            isActive:
+                pathname.includes("setup") ||
+                pathname.includes("webhook-catalogs") ||
+                pathname.includes("rate-limit-schemes"),
+        },
+        {
+            title: "Subscription & Billing",
+            url: "billing",
+            icon: IconCreditCard,
+            isActive: pathname.includes("billing"),
+        },
+    ];
+
+    const navDevelopers = [
+        {
+            title: "API Keys",
+            url: "api-keys",
+            icon: IconKey,
+            isActive: pathname.includes("api-keys"),
+        },
+        {
+            title: "Webhooks",
+            url: "webhooks",
+            icon: IconBolt,
+            isActive: pathname.includes("webhooks"),
+        },
+        {
+            title: "Agents Platform",
+            url: "llms/ai-agents",
+            icon: IconRobot,
+            isActive: isAgentsPlatformRoute,
+        },
+    ];
+
+    const navOnboarding = [
+        ...(isProductionDeployment
+            ? [
+                  {
+                      title: "Go Live",
+                      url: "go-live",
+                      icon: IconSettings,
+                      isActive: pathname.includes("/go-live"),
+                  },
+              ]
+            : []),
+        {
+            title: "Quickstart",
+            url: "getting-started",
+            icon: IconRocket,
+            isActive: pathname.includes("getting-started"),
+        },
+    ];
+
+    return (
+        <Sidebar collapsible="offcanvas" {...props}>
+            <SidebarHeader className="h-(--header-height) shrink-0 justify-center border-b">
+                <SidebarMenu>
+                    <SidebarMenuItem>
+                        <OrganizationSwitcher />
+                    </SidebarMenuItem>
+                </SidebarMenu>
+            </SidebarHeader>
+            <SidebarContent className="pt-4">
+                <div className="flex flex-col gap-3">
+                    <NavMain items={navOnboarding} />
+                    <NavMain title="Management" items={navManagement} />
+                    <NavMain title="Configuration" items={navConfiguration} />
+                    <NavMain title="Developers" items={navDevelopers} />
+                </div>
+            </SidebarContent>
+        </Sidebar>
+    );
+}

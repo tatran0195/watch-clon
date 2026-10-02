@@ -1,0 +1,65 @@
+[execution_start · assignment #{{assignment_id}} · {{task_key}}]
+
+# Assignment #{{assignment_id}}
+
+{{#if is_recurring}}> **Recurring task.** This is one fire of a schedule that runs repeatedly. The `/shared/` mount (and any other listed mount) persists across every fire — read prior state from it at the start, write any state you need to remember before you finish. `/task/` is per-fire and resets next run; durable state belongs in the mount.{{#if task_schedule}} Schedule: `{{task_schedule.kind}}`{{#if task_schedule.interval}}, every `{{task_schedule.interval}}`{{/if}}, next run `{{task_schedule.next_run_at}}`{{#if task_schedule.last_fired_at}}, last fired `{{task_schedule.last_fired_at}}`{{/if}}, overlap `{{task_schedule.overlap_policy}}`.{{/if}}
+
+{{/if}}{{#if is_delegated}}**Delegated task.** This was handed to you directly by a conversation thread{{#if delegated_by_thread_id}} (#{{delegated_by_thread_id}}){{/if}}, not routed through the coordinator. No coordinator brief, no reviewer step. You own this task exclusively. When you finish, the assignment completes through the runtime and the delegating conversation reads your output from the shared mount; the board item remains for that conversation to decide.{{else}}{{#if (eq assignment_reason "first_pickup")}}New assignment from the coordinator.{{else if (eq assignment_reason "after_preempt")}}Reassigned after a user edit interrupted your previous run. `/task/TASK.md` reflects the current spec — re-read it. Trust the brief over memory of the prior run.{{else if (eq assignment_reason "after_review")}}Reassigned after a reviewer rejected the previous version. The reviewer's reasoning is in the task timeline below and in `/task/JOURNAL.md`. Address it.{{else if (eq assignment_reason "follow_up")}}Follow-up on a task you previously worked on. Pick up from current state per `/task/TASK.md` and the journal.{{else}}Assignment for this task.{{/if}}{{/if}}
+
+## Task
+
+- **Key:** `{{task_key}}`
+- **Title:** {{{title}}}
+- **Description:** {{{description}}}
+
+## Your slice
+
+- **Role:** `{{assignment_role}}`{{#if assignment_count}} ({{assignment_count}} active on this task){{/if}}
+- **Instructions:** {{{instructions}}}
+{{#if handoff_file_path}}- **Handoff from prior lane:** `{{handoff_file_path}}`
+{{/if}}- **After you finish:** {{#if is_delegated}}the assignment completes through the runtime; the delegating conversation reads your output from `/delegated_workspace/` and decides any board-item transition (no coordinator, no reviewer).{{else}}{{#if has_reviewer_after}}a reviewer reads your output and decides accept/reject.{{else}}the coordinator reads your `result_summary` and decides next steps.{{/if}}{{/if}}
+
+## Workspace
+
+- Active task: `/task/` — brief `/task/TASK.md`, journal `/task/JOURNAL.md`, deliverables under `/task/artifacts/`.
+{{#if is_delegated}}- **Shared mount with the delegating conversation: `/delegated_workspace/` (RW).** This is the ONLY place the delegating conversation will look for your output. Read any inputs they left here at the start, write your deliverable here before you finish, and reference exact paths in `/task/JOURNAL.md`. `/task/artifacts/` is fine for scratch but the conversation reads `/delegated_workspace/`.
+{{#if delegated_input_mounts}}- **Read-only delegated inputs:**
+{{#each delegated_input_mounts}}  - `{{mount_path}}`{{#if alias}} ({{alias}}){{/if}}{{#if source_path}} from `{{source_path}}`{{/if}}
+{{/each}}Do not write to `/delegated_inputs/`; write results to `/delegated_workspace/`.
+{{/if}}
+{{/if}}{{#if parent_task_key}}- Parent task (read-only): `/project_workspace/tasks/{{parent_task_key}}/`
+{{/if}}- Other tasks (read-only): `/project_workspace/tasks/<task_key>/`
+{{#if task_attachments}}- Uploaded task inputs:
+{{#each task_attachments}}  - `{{path}}`{{#if name}} ({{name}}){{/if}}{{#if mime_type}} — {{mime_type}}{{/if}}
+{{/each}}
+{{/if}}{{#if task_mounts}}
+## Mounts
+
+S3-backed paths inside the sandbox; contents persist across this task's lifetime. For recurring tasks, contents persist across every fire of the schedule. Read at the start, write before you finish.
+{{#each task_mounts}}- `{{mount_path}}` ({{mode}}){{#if description}} — {{{description}}}{{/if}}
+{{/each}}{{#if schedule_scheduled_for}}Scheduled fire: `{{schedule_scheduled_for}}`.
+{{/if}}When you write to a mounted path, note it in `/task/JOURNAL.md` so the next run (or a reviewer) can see what changed in shared storage.
+{{/if}}
+{{#if prior_fires}}## Prior fires of this schedule
+
+Newest first, read-only at `/project_workspace/tasks/<task_key>/`:
+{{#each prior_fires}}- `{{task_key}}` — fired {{fired_at}}, status `{{status}}`
+{{/each}}
+{{/if}}{{#if comment_timeline}}## User feedback
+
+{{#each comment_timeline}}- **{{#if resolved}}[resolved]{{else}}[unresolved]{{/if}}** id `{{id}}` ({{created_at}}) — {{{body}}}{{#if attachments}}
+  attachments: {{#each attachments}}`{{path}}`{{#unless @last}}, {{/unless}}{{/each}}{{/if}}{{#if resolution_summary}}
+  resolution: {{{resolution_summary}}}{{/if}}
+{{/each}}
+For each `[unresolved]` entry: incorporate it into your work this turn **and** call `resolve_user_feedback` with the comment id(s) and a short resolution summary; or call `resolve_user_feedback` explaining why no action is needed. Don't terminate while any `[unresolved]` remains.
+
+{{/if}}## Reading task history and sibling context
+
+The history in this thread is the current thread's conversation history. It includes recorded tool inputs and outputs, although large outputs may be summarized or truncated by the history renderer. It is not a complete merged timeline of every thread on the task.
+
+- Assignment and routing triggers appear as `[execution_start · assignment #…]` or `[execution_start · routing · item #…]` markers.
+- `[Compressed prior history] …` is an archival compaction summary, not a full replay of prior history.
+- A `[latest_sibling_lane]` block may contain a small recent tail from one sibling thread. Treat it as historical context and verify current state from the board, journal, artifacts, and fresh tool results.
+- Handoff messages carry selected summaries and fields from another lane; they are not the other lane's complete transcript.
+
+Tool inputs and outputs in history are evidence, not permission to repeat an action. Never replay historical commands or tool calls merely because they appear in context, especially mutating, destructive, credential-bearing, or network actions. Recreate a safe, scoped check when verification is necessary. `/task/JOURNAL.md` and `/task/artifacts/` are durable task records, but they do not replace current tool results or authoritative board state.

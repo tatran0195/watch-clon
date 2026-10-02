@@ -1,0 +1,995 @@
+use super::core::AgentExecutor;
+use super::tool_params::MAX_LOADED_EXTERNAL_TOOLS;
+use crate::llm::{
+    NativeToolDefinition, SemanticLlmMessage, SemanticLlmPromptConfig, SemanticLlmRequest,
+};
+use crate::tools::external::{
+    search_external_tools, synthetic_tool_id, EXTERNAL_PROVIDER_COMPOSIO,
+};
+use common::error::AppError;
+use dto::json::agent_executor::{
+    ExternalToolCall, LoadToolsParams, SearchToolsParams, ToolCallRequest,
+};
+use models::{AiTool, AiToolConfiguration, SchemaField};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolSearchResponse {
+    results: Vec<ToolSearchQueryResult>,
+    #[serde(default)]
+    recommended_tool_names: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolSearchQueryResult {
+    query: String,
+    #[serde(default)]
+    matches: Vec<ToolSearchMatch>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolSearchMatch {
+    tool_name: String,
+    reason: String,
+    #[serde(default)]
+    recommended: bool,
+}
+
+fn mcp_schema_to_fields(schema: &serde_json::Value) -> Vec<SchemaField> {
+    let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return Vec::new();
+    };
+    let required_set: std::collections::HashSet<&str> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    properties
+        .iter()
+        .map(|(name, prop)| {
+            let field_type = match prop
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("string")
+            {
+                "integer" | "number" => "NUMBER",
+                "boolean" => "BOOLEAN",
+                "array" => "ARRAY",
+                "object" => "OBJECT",
+                _ => "STRING",
+            };
+            SchemaField {
+                name: name.clone(),
+                field_type: field_type.to_string(),
+                required: required_set.contains(name.as_str()),
+                description: prop
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(|s| s.to_string()),
+                title: prop
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string()),
+                enum_values: prop
+                    .get("enum")
+                    .and_then(|e| e.as_array())
+                    .map(|arr| arr.clone()),
+                ..SchemaField::default()
+            }
+        })
+        .collect()
+}
+
+impl AgentExecutor {
+    fn tool_schema_for_execution(
+        &self,
+        tool: &AiTool,
+        active_board_item: Option<&dto::json::ProjectTaskBoardPromptItem>,
+    ) -> Vec<SchemaField> {
+        let mut fields = Self::tool_input_schema_for_search(tool);
+        self.constrain_tool_input_schema(tool, &mut fields, active_board_item);
+        fields
+    }
+
+    fn normalize_tool_input_value(input: Value, schema_fields: &[SchemaField]) -> Value {
+        match input {
+            Value::Object(map) => {
+                Value::Object(Self::normalize_tool_input_object(map, schema_fields))
+            }
+            other => other,
+        }
+    }
+
+    fn normalize_tool_input_object(
+        mut input: serde_json::Map<String, Value>,
+        schema_fields: &[SchemaField],
+    ) -> serde_json::Map<String, Value> {
+        for field in schema_fields {
+            let Some(current_value) = input.get(&field.name).cloned() else {
+                continue;
+            };
+
+            if current_value.is_null() && !field.required {
+                input.remove(&field.name);
+                continue;
+            }
+
+            input.insert(
+                field.name.clone(),
+                Self::coerce_to_field(current_value, field),
+            );
+        }
+
+        input
+    }
+
+    /// Lossless, schema-driven coercion. Anything ambiguous passes through
+    /// unchanged and fails parsing with the expected-parameter hint instead.
+    fn coerce_to_field(value: Value, field: &SchemaField) -> Value {
+        match field.field_type.as_str() {
+            "OBJECT" => {
+                let value = Self::parse_json_string(value, |v| v.is_object());
+                match value {
+                    Value::Object(nested) => Value::Object(Self::normalize_tool_input_object(
+                        nested,
+                        field.properties.as_deref().unwrap_or(&[]),
+                    )),
+                    other => other,
+                }
+            }
+            "ARRAY" => {
+                let value = Self::parse_json_string(value, |v| v.is_array());
+                // None = unknown item type (e.g. MCP schemas): wrap shape, never coerce items.
+                let items_type = field.items_type.as_deref();
+                let items = match value {
+                    Value::Array(items) => items,
+                    Value::Object(o) if items_type == Some("OBJECT") => vec![Value::Object(o)],
+                    scalar @ (Value::String(_) | Value::Bool(_) | Value::Number(_))
+                        if items_type != Some("OBJECT") =>
+                    {
+                        vec![scalar]
+                    }
+                    other => return other,
+                };
+                let nested_schema = field
+                    .items_schema
+                    .as_deref()
+                    .and_then(|item| item.properties.as_deref())
+                    .unwrap_or(&[]);
+                Value::Array(
+                    items
+                        .into_iter()
+                        .map(|item| match (items_type, item) {
+                            (Some("OBJECT"), Value::Object(nested)) => Value::Object(
+                                Self::normalize_tool_input_object(nested, nested_schema),
+                            ),
+                            (Some(scalar_type), item) if scalar_type != "OBJECT" => {
+                                Self::coerce_scalar(item, scalar_type)
+                            }
+                            (_, item) => item,
+                        })
+                        .collect(),
+                )
+            }
+            scalar_type => Self::coerce_scalar(value, scalar_type),
+        }
+    }
+
+    fn coerce_scalar(value: Value, field_type: &str) -> Value {
+        // Scalar expected but the model wrapped it in an array (["1"], [true],
+        // ["a", "b"]) — take the first element and coerce it. Empty array has
+        // nothing to unwrap, so leave it untouched.
+        if let Value::Array(items) = value {
+            return match items.into_iter().next() {
+                Some(first) => Self::coerce_scalar(first, field_type),
+                None => Value::Array(Vec::new()),
+            };
+        }
+        match (field_type, value) {
+            ("BOOLEAN", Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" => Value::Bool(true),
+                "false" => Value::Bool(false),
+                _ => Value::String(s),
+            },
+            ("INTEGER", Value::String(s)) => match s.trim().parse::<i64>() {
+                Ok(n) => Value::Number(n.into()),
+                Err(_) => Value::String(s),
+            },
+            ("INTEGER", Value::Number(n)) => {
+                // Float with zero fraction → integer (serde rejects 5.0 for u64/i64).
+                match n.as_f64() {
+                    Some(f)
+                        if n.as_i64().is_none()
+                            && n.as_u64().is_none()
+                            && f.fract() == 0.0
+                            && f >= i64::MIN as f64
+                            && f < i64::MAX as f64 =>
+                    {
+                        Value::Number((f as i64).into())
+                    }
+                    _ => Value::Number(n),
+                }
+            }
+            ("NUMBER", Value::String(s)) => {
+                if let Ok(n) = s.trim().parse::<i64>() {
+                    Value::Number(n.into())
+                } else if let Some(n) = s
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(serde_json::Number::from_f64)
+                {
+                    Value::Number(n)
+                } else {
+                    Value::String(s)
+                }
+            }
+            ("STRING", Value::Bool(b)) => Value::String(b.to_string()),
+            ("STRING", Value::Number(n)) => Value::String(n.to_string()),
+            (_, other) => other,
+        }
+    }
+
+    /// LLMs often emit JSON-encoded-as-string for structured params; parse it
+    /// when the result matches the expected shape, otherwise leave untouched.
+    fn parse_json_string(value: Value, matches_shape: impl Fn(&Value) -> bool) -> Value {
+        match value {
+            Value::String(s) => match serde_json::from_str::<Value>(&s) {
+                Ok(parsed) if matches_shape(&parsed) => parsed,
+                _ => Value::String(s),
+            },
+            other => other,
+        }
+    }
+
+    pub(crate) fn tool_input_schema_for_search(tool: &AiTool) -> Vec<SchemaField> {
+        match &tool.configuration {
+            AiToolConfiguration::Internal(config) => {
+                config.input_schema.clone().unwrap_or_default()
+            }
+            AiToolConfiguration::Mcp(config) => config
+                .input_schema
+                .as_ref()
+                .map(mcp_schema_to_fields)
+                .unwrap_or_default(),
+            AiToolConfiguration::CodeRunner(config) => {
+                config.input_schema.clone().unwrap_or_default()
+            }
+            AiToolConfiguration::Api(config) => {
+                let mut fields = config.request_body_schema.clone().unwrap_or_default();
+                if let Some(url_params_fields) = &config.url_params_schema {
+                    fields.extend(url_params_fields.iter().cloned());
+                }
+                fields
+            }
+            AiToolConfiguration::PlatformEvent(_) => Vec::new(),
+            AiToolConfiguration::Virtual(config) => config
+                .input_schema
+                .as_ref()
+                .map(mcp_schema_to_fields)
+                .unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn validate_selected_tool_input(
+        tool: &AiTool,
+        input_object: &serde_json::Map<String, Value>,
+    ) -> Result<(), AppError> {
+        let missing_required_fields = Self::tool_input_schema_for_search(tool)
+            .into_iter()
+            .filter(|field| field.required)
+            .map(|field| field.name)
+            .filter(|field_name| !input_object.contains_key(field_name))
+            .collect::<Vec<_>>();
+
+        if missing_required_fields.is_empty() {
+            return Ok(());
+        }
+
+        Err(AppError::BadRequest(format!(
+            "Selected tool '{}' is missing required parameters: {}",
+            tool.name,
+            missing_required_fields.join(", ")
+        )))
+    }
+
+    pub(crate) fn build_native_tool_definition(
+        &self,
+        tool: &AiTool,
+        active_board_item: Option<&dto::json::ProjectTaskBoardPromptItem>,
+    ) -> NativeToolDefinition {
+        let description = tool
+            .description
+            .clone()
+            .unwrap_or_else(|| format!("Call the {} tool.", tool.name));
+        let agent_facing_name =
+            dto::json::tool_calls::agent_facing_tool_name(&tool.name).to_string();
+
+        if let AiToolConfiguration::Mcp(config) = &tool.configuration {
+            return NativeToolDefinition {
+                name: agent_facing_name,
+                description,
+                input_schema: config
+                    .input_schema
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}})),
+            };
+        }
+        if let AiToolConfiguration::Virtual(config) = &tool.configuration {
+            return NativeToolDefinition {
+                name: agent_facing_name,
+                description,
+                input_schema: config
+                    .input_schema
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}})),
+            };
+        }
+
+        NativeToolDefinition {
+            name: agent_facing_name,
+            description,
+            input_schema: SchemaField::object_json_schema(
+                &self.tool_schema_for_execution(tool, active_board_item),
+            ),
+        }
+    }
+
+    pub(crate) fn build_tool_call_request_from_native_call(
+        &self,
+        tool: &AiTool,
+        input_object: serde_json::Map<String, Value>,
+    ) -> Result<ToolCallRequest, AppError> {
+        Self::validate_selected_tool_input(tool, &input_object)?;
+        Self::build_tool_call_request(tool, Value::Object(input_object)).map_err(|err| match err {
+            AppError::BadRequest(msg) => {
+                let fields = Self::tool_input_schema_for_search(tool);
+                if fields.is_empty() {
+                    return AppError::BadRequest(msg);
+                }
+                let expected = fields
+                    .iter()
+                    .map(|f| {
+                        format!(
+                            "{}: {}{}",
+                            f.name,
+                            f.field_type.to_lowercase(),
+                            if f.required { " (required)" } else { "" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                AppError::BadRequest(format!("{msg}. Expected parameters — {expected}"))
+            }
+            other => other,
+        })
+    }
+
+    pub(crate) fn parse_tool_params<T: DeserializeOwned>(
+        tool_name: &str,
+        input: Value,
+    ) -> Result<T, AppError> {
+        serde_json::from_value(input)
+            .map_err(|e| AppError::BadRequest(format!("Invalid {tool_name} params: {e}")))
+    }
+
+    pub(crate) fn build_tool_call_request(
+        tool: &AiTool,
+        input: Value,
+    ) -> Result<ToolCallRequest, AppError> {
+        let input_schema = Self::tool_input_schema_for_search(tool);
+        let normalized_input = Self::normalize_tool_input_value(input, &input_schema);
+
+        match &tool.configuration {
+            AiToolConfiguration::Internal(config) => match config.tool_type {
+                models::InternalToolType::SearchTools => Ok(ToolCallRequest::SearchTools {
+                    params: Self::parse_tool_params("search_tools", normalized_input)?,
+                }),
+                models::InternalToolType::LoadTools => Ok(ToolCallRequest::LoadTools {
+                    params: Self::parse_tool_params("load_tools", normalized_input)?,
+                }),
+                models::InternalToolType::ReadImage => Ok(ToolCallRequest::ReadImage {
+                    params: Self::parse_tool_params("read_image", normalized_input)?,
+                }),
+                models::InternalToolType::ReadFile => Ok(ToolCallRequest::ReadFile {
+                    params: Self::parse_tool_params("read_file", normalized_input)?,
+                }),
+                models::InternalToolType::WriteFile => Ok(ToolCallRequest::WriteFile {
+                    params: Self::parse_tool_params("write_file", normalized_input)?,
+                }),
+                models::InternalToolType::AppendFile => Ok(ToolCallRequest::AppendFile {
+                    params: Self::parse_tool_params("append_file", normalized_input)?,
+                }),
+                models::InternalToolType::EditFile => Ok(ToolCallRequest::EditFile {
+                    params: Self::parse_tool_params("edit_file", normalized_input)?,
+                }),
+                models::InternalToolType::ExecuteCommand => Ok(ToolCallRequest::ExecuteCommand {
+                    params: Self::parse_tool_params(
+                        dto::json::tool_calls::EXECUTE_COMMAND_AGENT_FACING,
+                        normalized_input,
+                    )?,
+                }),
+                models::InternalToolType::Sleep => Ok(ToolCallRequest::Sleep {
+                    params: Self::parse_tool_params("sleep", normalized_input)?,
+                }),
+                models::InternalToolType::WebSearch => Ok(ToolCallRequest::WebSearch {
+                    params: Self::parse_tool_params("web_search", normalized_input)?,
+                }),
+                models::InternalToolType::UrlContent => Ok(ToolCallRequest::UrlContent {
+                    params: Self::parse_tool_params("url_content", normalized_input)?,
+                }),
+                models::InternalToolType::SearchKnowledgebase => {
+                    Ok(ToolCallRequest::SearchKnowledgebase {
+                        params: Self::parse_tool_params("search_knowledgebase", normalized_input)?,
+                    })
+                }
+                models::InternalToolType::LoadMemory => Ok(ToolCallRequest::LoadMemory {
+                    params: Self::parse_tool_params("load_memory", normalized_input)?,
+                }),
+                models::InternalToolType::SaveMemory => Ok(ToolCallRequest::SaveMemory {
+                    params: Self::parse_tool_params("save_memory", normalized_input)?,
+                }),
+                models::InternalToolType::UpdateMemory => Ok(ToolCallRequest::UpdateMemory {
+                    params: Self::parse_tool_params(
+                        dto::json::tool_calls::agent_facing_tool_name("update_memory"),
+                        normalized_input,
+                    )?,
+                }),
+                models::InternalToolType::CreateProjectTask => {
+                    Ok(ToolCallRequest::CreateProjectTask {
+                        params: Self::parse_tool_params("create_project_task", normalized_input)?,
+                    })
+                }
+                models::InternalToolType::UpdateProjectTask => {
+                    Ok(ToolCallRequest::UpdateProjectTask {
+                        params: Self::parse_tool_params("update_project_task", normalized_input)?,
+                    })
+                }
+                models::InternalToolType::AssignProjectTask => {
+                    Ok(ToolCallRequest::AssignProjectTask {
+                        params: Self::parse_tool_params("assign_project_task", normalized_input)?,
+                    })
+                }
+                models::InternalToolType::ListThreads => Ok(ToolCallRequest::ListThreads {
+                    params: Self::parse_tool_params("list_threads", normalized_input)?,
+                }),
+                models::InternalToolType::CreateThread => Ok(ToolCallRequest::CreateThread {
+                    params: Self::parse_tool_params("create_thread", normalized_input)?,
+                }),
+                models::InternalToolType::UpdateThread => Ok(ToolCallRequest::UpdateThread {
+                    params: Self::parse_tool_params("update_thread", normalized_input)?,
+                }),
+                models::InternalToolType::TaskGraphAddNode => {
+                    Ok(ToolCallRequest::TaskGraphAddNode {
+                        params: Self::parse_tool_params("task_graph_add_node", normalized_input)?,
+                    })
+                }
+                models::InternalToolType::TaskGraphAddDependency => {
+                    Ok(ToolCallRequest::TaskGraphAddDependency {
+                        params: Self::parse_tool_params(
+                            "task_graph_add_dependency",
+                            normalized_input,
+                        )?,
+                    })
+                }
+                models::InternalToolType::TaskGraphMarkInProgress => {
+                    Ok(ToolCallRequest::TaskGraphMarkInProgress {
+                        params: Self::parse_tool_params(
+                            "task_graph_mark_in_progress",
+                            normalized_input,
+                        )?,
+                    })
+                }
+                models::InternalToolType::TaskGraphCompleteNode => {
+                    Ok(ToolCallRequest::TaskGraphCompleteNode {
+                        params: Self::parse_tool_params(
+                            "task_graph_complete_node",
+                            normalized_input,
+                        )?,
+                    })
+                }
+                models::InternalToolType::TaskGraphFailNode => {
+                    Ok(ToolCallRequest::TaskGraphFailNode {
+                        params: Self::parse_tool_params("task_graph_fail_node", normalized_input)?,
+                    })
+                }
+                models::InternalToolType::TaskGraphReset => Ok(ToolCallRequest::TaskGraphReset {
+                    params: Self::parse_tool_params("task_graph_reset", normalized_input)?,
+                }),
+                models::InternalToolType::AskUser => Ok(ToolCallRequest::AskUser {
+                    params: Self::parse_tool_params("ask_user", normalized_input)?,
+                }),
+                models::InternalToolType::SubscribeToTask => Ok(ToolCallRequest::SubscribeToTask {
+                    params: Self::parse_tool_params("subscribe_to_task", normalized_input)?,
+                }),
+                models::InternalToolType::UnsubscribeFromTask => {
+                    Ok(ToolCallRequest::UnsubscribeFromTask {
+                        params: Self::parse_tool_params("unsubscribe_from_task", normalized_input)?,
+                    })
+                }
+                models::InternalToolType::DelegateTask => Ok(ToolCallRequest::DelegateTask {
+                    params: Self::parse_tool_params("delegate_task", normalized_input)?,
+                }),
+                models::InternalToolType::GetProjectTask => Ok(ToolCallRequest::GetProjectTask {
+                    params: Self::parse_tool_params("get_project_task", normalized_input)?,
+                }),
+                models::InternalToolType::AppendTaskJournal => Err(AppError::BadRequest(
+                    "append_task_journal is not exposed in the runtime".to_string(),
+                )),
+            },
+            _ => Ok(ToolCallRequest::External(ExternalToolCall {
+                tool_name: tool.name.clone(),
+                input: normalized_input,
+            })),
+        }
+    }
+
+    pub(crate) fn external_tool_catalog(&self) -> Vec<AiTool> {
+        let mut tools: Vec<AiTool> = self
+            .ctx
+            .agent
+            .tools
+            .iter()
+            .filter(|tool| !matches!(tool.tool_type, models::AiToolType::Internal))
+            .cloned()
+            .collect();
+        tools.extend(self.virtual_tool_cache.values().cloned());
+        tools
+    }
+
+    pub(crate) async fn execute_search_tools(
+        &mut self,
+        params: SearchToolsParams,
+    ) -> Result<Value, AppError> {
+        let queries = params
+            .queries
+            .into_iter()
+            .map(|query| query.trim().to_string())
+            .filter(|query| !query.is_empty())
+            .take(10)
+            .collect::<Vec<_>>();
+        let apps = params
+            .apps
+            .into_iter()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+
+        let mode = match params.mode {
+            dto::json::tool_calls::SearchToolsMode::Search => {
+                crate::tools::external::ExternalSearchMode::Keyword
+            }
+            dto::json::tool_calls::SearchToolsMode::Browse => {
+                crate::tools::external::ExternalSearchMode::Browse
+            }
+        };
+
+        let is_browse = matches!(mode, crate::tools::external::ExternalSearchMode::Browse);
+        let browse_unscoped = is_browse && apps.is_empty();
+
+        if !is_browse && queries.is_empty() {
+            return Ok(json!({
+                "results": [],
+                "recommended_tool_names": [],
+                "tool_catalog_size": 0
+            }));
+        }
+
+        let browse_scoped_default = 100;
+        let browse_scoped_cap = 200;
+        let max_results = if is_browse && !browse_unscoped {
+            params
+                .max_results_per_query
+                .unwrap_or(browse_scoped_default)
+                .clamp(1, browse_scoped_cap)
+        } else {
+            params.max_results_per_query.unwrap_or(10).clamp(1, 25)
+        };
+        let effective_browse_limit = if browse_unscoped {
+            max_results.min(5)
+        } else {
+            max_results
+        };
+
+        if is_browse {
+            let apps_arg: Option<&[String]> = if apps.is_empty() {
+                None
+            } else {
+                Some(apps.as_slice())
+            };
+            self.populate_virtual_tool_cache_browse(apps_arg, effective_browse_limit)
+                .await;
+        } else {
+            let apps_filter = if apps.is_empty() {
+                None
+            } else {
+                Some(apps.as_slice())
+            };
+            self.populate_virtual_tool_cache(&queries, apps_filter, max_results)
+                .await;
+        }
+        let external_tools = self.external_tool_catalog();
+        if external_tools.is_empty() {
+            return Ok(json!({
+                "results": [],
+                "recommended_tool_names": [],
+                "tool_catalog_size": 0
+            }));
+        }
+
+        if is_browse {
+            let matches = external_tools
+                .iter()
+                .map(|tool| {
+                    let input_schema = match &tool.configuration {
+                        AiToolConfiguration::Virtual(config) => config
+                            .input_schema
+                            .clone()
+                            .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                        AiToolConfiguration::Mcp(config) => config
+                            .input_schema
+                            .clone()
+                            .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                        _ => SchemaField::object_json_schema(&Self::tool_input_schema_for_search(
+                            tool,
+                        )),
+                    };
+                    json!({
+                        "tool_name": tool.name,
+                        "description": tool.description,
+                        "input_schema": input_schema,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let recommended: Vec<String> = Vec::new();
+            let apps_searched: Vec<String> = if apps.is_empty() {
+                external_tools
+                    .iter()
+                    .filter_map(|tool| match &tool.configuration {
+                        AiToolConfiguration::Virtual(cfg) => Some(cfg.toolkit_slug.clone()),
+                        _ => None,
+                    })
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            } else {
+                apps.clone()
+            };
+            let mut response = json!({
+                "results": [{ "apps": apps_searched, "matches": matches }],
+                "recommended_tool_names": recommended,
+                "tool_catalog_size": external_tools.len(),
+            });
+            if browse_unscoped {
+                if let Some(obj) = response.as_object_mut() {
+                    obj.insert(
+                        "hint".to_string(),
+                        json!(format!(
+                            "browse was called without `apps`; auto-expanded across all connected apps with a reduced per-app cap of {}. For deeper coverage of a specific service, re-call with `apps: [\"<slug>\"]`.",
+                            effective_browse_limit
+                        )),
+                    );
+                }
+            }
+            return Ok(response);
+        }
+
+        let tool_names = external_tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        let tool_catalog = external_tools
+            .iter()
+            .map(|tool| {
+                let input_schema = match &tool.configuration {
+                    AiToolConfiguration::Mcp(config) => config
+                        .input_schema
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}})),
+                    AiToolConfiguration::Virtual(config) => config
+                        .input_schema
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}})),
+                    _ => SchemaField::object_json_schema(&Self::tool_input_schema_for_search(tool)),
+                };
+                json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": input_schema,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let response_schema = json!({
+            "type": "OBJECT",
+            "properties": {
+                "results": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "query": { "type": "STRING" },
+                            "matches": {
+                                "type": "ARRAY",
+                                "items": {
+                                    "type": "OBJECT",
+                                    "properties": {
+                                        "tool_name": { "type": "STRING", "enum": tool_names },
+                                        "reason": { "type": "STRING" },
+                                        "recommended": { "type": "BOOLEAN" }
+                                    },
+                                    "required": ["tool_name", "reason", "recommended"]
+                                }
+                            }
+                        },
+                        "required": ["query", "matches"]
+                    }
+                },
+                "recommended_tool_names": {
+                    "type": "ARRAY",
+                    "items": { "type": "STRING", "enum": tool_names }
+                }
+            },
+            "required": ["results", "recommended_tool_names"]
+        });
+
+        let prompt = format!(
+            r#"Find the best external tool matches for the given queries.
+Use only exact tool names from the provided catalog.
+Consider the chat history and current user request as context.
+Return at most {} matches per query.
+
+Current user request:
+{}
+
+Queries:
+{}
+
+External tool catalog with descriptions and input schemas:
+{}"#,
+            max_results,
+            self.user_request,
+            serde_json::to_string_pretty(&queries).unwrap_or_else(|_| "[]".to_string()),
+            serde_json::to_string_pretty(&tool_catalog).unwrap_or_else(|_| "[]".to_string())
+        );
+
+        let config = SemanticLlmPromptConfig {
+            response_json_schema: response_schema,
+            temperature: None,
+            max_output_tokens: None,
+            reasoning_effort: None,
+        };
+        let messages = self
+            .get_conversation_history_for_llm()
+            .await
+            .iter()
+            .map(Self::semantic_message_from_history_entry)
+            .chain(std::iter::once(SemanticLlmMessage::text("user", prompt)))
+            .collect::<Vec<_>>();
+        let request = SemanticLlmRequest::from_config(
+            r#"You are a tool matcher. Match the request to the best external tools from the provided catalog. Use only exact tool names from the catalog and be conservative."#
+                .to_string(),
+            messages,
+            config,
+        );
+
+        let response = self
+            .create_weak_llm()
+            .await?
+            .generate_structured_from_prompt::<ToolSearchResponse>(request, None)
+            .await?;
+        let response = response.value;
+
+        let catalog_by_name = external_tools
+            .iter()
+            .map(|tool| (tool.name.clone(), tool))
+            .collect::<HashMap<_, _>>();
+
+        let results = response
+            .results
+            .into_iter()
+            .map(|result| {
+                let matches = result
+                    .matches
+                    .into_iter()
+                    .filter_map(|matched| {
+                        let tool = catalog_by_name.get(&matched.tool_name)?;
+                        let input_schema = match &tool.configuration {
+                            AiToolConfiguration::Mcp(config) => {
+                                config.input_schema.clone().unwrap_or_else(
+                                    || serde_json::json!({"type": "object", "properties": {}}),
+                                )
+                            }
+                            AiToolConfiguration::Virtual(config) => {
+                                config.input_schema.clone().unwrap_or_else(
+                                    || serde_json::json!({"type": "object", "properties": {}}),
+                                )
+                            }
+                            _ => SchemaField::object_json_schema(
+                                &Self::tool_input_schema_for_search(tool),
+                            ),
+                        };
+                        Some(json!({
+                            "tool_name": matched.tool_name,
+                            "reason": matched.reason,
+                            "recommended": matched.recommended,
+                            "description": tool.description,
+                            "input_schema": input_schema,
+                        }))
+                    })
+                    .collect::<Vec<_>>();
+                json!({
+                    "query": result.query,
+                    "matches": matches,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(json!({
+            "results": results,
+            "recommended_tool_names": response.recommended_tool_names,
+            "tool_catalog_size": external_tools.len(),
+        }))
+    }
+
+    pub(crate) async fn execute_load_tools(
+        &mut self,
+        params: LoadToolsParams,
+    ) -> Result<Value, AppError> {
+        let requested_tool_names = params
+            .tool_names
+            .into_iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>();
+        if requested_tool_names.is_empty() {
+            return Ok(json!({
+                "loaded_tool_names": [],
+                "evicted_tool_names": [],
+                "not_found_tool_names": [],
+                "currently_loaded_tool_names": [],
+            }));
+        }
+
+        let external_tools = self.external_tool_catalog();
+        let external_by_name = external_tools
+            .iter()
+            .map(|tool| (tool.name.clone(), tool))
+            .collect::<HashMap<_, _>>();
+
+        let mut matched_tools = Vec::new();
+        let mut not_found_tool_names = Vec::new();
+        for tool_name in requested_tool_names {
+            if let Some(tool) = external_by_name.get(&tool_name) {
+                matched_tools.push((*tool).clone());
+            } else {
+                not_found_tool_names.push(tool_name);
+            }
+        }
+
+        for tool in &matched_tools {
+            self.loaded_external_tool_ids
+                .retain(|tool_id| *tool_id != tool.id);
+            self.loaded_external_tool_ids.push(tool.id);
+        }
+
+        let mut evicted_tool_names = Vec::new();
+        while self.loaded_external_tool_ids.len() > MAX_LOADED_EXTERNAL_TOOLS {
+            let evicted_id = self.loaded_external_tool_ids.remove(0);
+            if let Some(tool) = external_tools.iter().find(|tool| tool.id == evicted_id) {
+                evicted_tool_names.push(tool.name.clone());
+            }
+        }
+
+        let currently_loaded_tools = self
+            .loaded_external_tool_ids
+            .iter()
+            .filter_map(|tool_id| external_tools.iter().find(|tool| tool.id == *tool_id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        Ok(json!({
+            "loaded_tool_names": matched_tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>(),
+            "evicted_tool_names": evicted_tool_names,
+            "not_found_tool_names": not_found_tool_names,
+            "currently_loaded_tool_names": currently_loaded_tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>(),
+            "currently_loaded_tools": currently_loaded_tools.iter().map(|tool| {
+                let input_schema = match &tool.configuration {
+                    AiToolConfiguration::Mcp(config) => config
+                        .input_schema
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}})),
+                    AiToolConfiguration::Virtual(config) => config
+                        .input_schema
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}})),
+                    _ => SchemaField::object_json_schema(&Self::tool_input_schema_for_search(tool)),
+                };
+                json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": input_schema,
+                })
+            }).collect::<Vec<_>>(),
+        }))
+    }
+
+    async fn populate_virtual_tool_cache(
+        &mut self,
+        queries: &[String],
+        apps: Option<&[String]>,
+        per_query_limit: usize,
+    ) {
+        let deployment_id = self.ctx.agent.deployment_id;
+        let actor_id = match self.ctx.get_thread().await {
+            Ok(thread) => thread.actor_id,
+            Err(_) => return,
+        };
+
+        let futures = queries.iter().map(|query| {
+            let state = &self.ctx.app_state;
+            let query = query.clone();
+            async move {
+                search_external_tools(
+                    state,
+                    deployment_id,
+                    actor_id,
+                    crate::tools::external::ExternalSearchOptions {
+                        mode: crate::tools::external::ExternalSearchMode::Keyword,
+                        query: Some(query.as_str()),
+                        apps,
+                        limit: per_query_limit,
+                    },
+                )
+                .await
+                .unwrap_or_default()
+            }
+        });
+        let batches = futures::future::join_all(futures).await;
+        self.merge_search_batches(batches);
+    }
+
+    async fn populate_virtual_tool_cache_browse(&mut self, apps: Option<&[String]>, limit: usize) {
+        let deployment_id = self.ctx.agent.deployment_id;
+        let actor_id = match self.ctx.get_thread().await {
+            Ok(thread) => thread.actor_id,
+            Err(_) => return,
+        };
+
+        let candidates = search_external_tools(
+            &self.ctx.app_state,
+            deployment_id,
+            actor_id,
+            crate::tools::external::ExternalSearchOptions {
+                mode: crate::tools::external::ExternalSearchMode::Browse,
+                query: None,
+                apps,
+                limit,
+            },
+        )
+        .await
+        .unwrap_or_default();
+        self.merge_search_batches(vec![candidates]);
+    }
+
+    fn merge_search_batches(
+        &mut self,
+        batches: Vec<Vec<crate::tools::external::ExternalToolCandidate>>,
+    ) {
+        for batch in batches {
+            for candidate in batch {
+                let id = synthetic_tool_id(
+                    EXTERNAL_PROVIDER_COMPOSIO,
+                    &candidate.toolkit_slug,
+                    &candidate.remote_tool_slug,
+                );
+                self.virtual_tool_cache
+                    .entry(id)
+                    .or_insert_with(|| candidate.into_ai_tool(id));
+            }
+        }
+    }
+}

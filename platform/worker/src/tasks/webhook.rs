@@ -1,0 +1,768 @@
+use anyhow::Result;
+use chrono::{SecondsFormat, Utc};
+use commands::{
+    SendEmailCommand,
+    webhook_delivery::{
+        ClearEndpointFailuresCommand, DeactivateEndpointCommand, DeleteActiveDeliveryCommand,
+        GetActiveDeliveryCommand, IncrementEndpointFailuresCommand, UpdateDeliveryAttemptsCommand,
+        calculate_next_retry,
+    },
+    webhook_subscription::evaluate_filter,
+};
+use common::db_router::ReadConsistency;
+use common::state::AppState;
+use common::utils::webhook::generate_webhook_signature;
+use dto::clickhouse::webhook::WebhookLog;
+use queries::GetWebhookAppByNameQuery;
+use reqwest::header::RETRY_AFTER;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::time::Instant;
+use tracing::{error, warn};
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct WebhookDeliveryTask {
+    pub delivery_id: i64,
+    pub deployment_id: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct WebhookBatchDeliveryTask {
+    pub delivery_ids: Vec<i64>,
+    pub deployment_id: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct WebhookRetryTask {
+    pub delivery_id: i64,
+    pub deployment_id: i64,
+}
+
+#[derive(Debug)]
+pub enum DeliveryResult {
+    Success,
+    Failed,
+    NotFound,
+    RetryAfter(std::time::Duration),
+}
+
+const STATUS_REQUEST_TIMEOUT: u16 = 408;
+const STATUS_TOO_MANY_REQUESTS: u16 = 429;
+const STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
+const WEBHOOK_FAILURE_EMAIL_COOLDOWN_SECONDS: u64 = 3600;
+
+fn failure_status_label(will_retry: bool) -> &'static str {
+    if will_retry {
+        "failed"
+    } else {
+        "permanently_failed"
+    }
+}
+
+fn build_webhook_log(
+    deployment_id: i64,
+    delivery_id: i64,
+    app_slug: &str,
+    endpoint_id: i64,
+    event_name: &str,
+    status: &str,
+    http_status_code: Option<i32>,
+    response_time_ms: Option<i32>,
+    attempt_number: i32,
+    max_attempts: i32,
+    payload: Option<String>,
+    response_body: Option<String>,
+    request_headers: Option<String>,
+) -> WebhookLog {
+    let payload_size_bytes = payload.as_ref().map_or(0, |p| p.len() as i32);
+
+    WebhookLog {
+        deployment_id,
+        delivery_id,
+        app_slug: app_slug.to_string(),
+        endpoint_id,
+        event_name: event_name.to_string(),
+        status: status.to_string(),
+        http_status_code,
+        response_time_ms,
+        attempt_number,
+        max_attempts,
+        payload,
+        payload_size_bytes,
+        response_body,
+        response_headers: None,
+        request_headers,
+        timestamp: Utc::now(),
+    }
+}
+
+async fn insert_webhook_log_safe(app_state: &AppState, log: &WebhookLog, label: &str) {
+    if let Err(e) = app_state.clickhouse_service.insert_webhook_log(log).await {
+        warn!("Failed to log {} to ClickHouse: {}", label, e);
+    }
+}
+
+async fn log_and_delete_active_delivery(
+    app_state: &AppState,
+    log: &WebhookLog,
+    label: &str,
+    delivery_id: i64,
+) -> Result<()> {
+    insert_webhook_log_safe(app_state, log, label).await;
+    delete_active_delivery(app_state, delivery_id).await
+}
+
+struct FailureContext {
+    delivery_id: i64,
+    deployment_id: i64,
+    app_slug: String,
+    endpoint_id: i64,
+    endpoint_url: String,
+    new_attempts: i32,
+    max_attempts: i32,
+}
+
+async fn log_failure_and_handle(
+    app_state: &AppState,
+    context: FailureContext,
+    log: &WebhookLog,
+    label: &str,
+    status_code: Option<u16>,
+    retry_after: Option<std::time::Duration>,
+) -> Result<DeliveryResult> {
+    insert_webhook_log_safe(app_state, log, label).await;
+    handle_delivery_failure(
+        context.delivery_id,
+        context.deployment_id,
+        context.app_slug,
+        context.endpoint_id,
+        context.endpoint_url,
+        context.new_attempts,
+        context.max_attempts,
+        status_code,
+        retry_after,
+        app_state,
+    )
+    .await
+}
+
+async fn delete_active_delivery(app_state: &AppState, delivery_id: i64) -> Result<()> {
+    DeleteActiveDeliveryCommand { delivery_id }
+        .execute_with_db(app_state.db_router.writer())
+        .await?;
+    Ok(())
+}
+
+async fn deactivate_endpoint(app_state: &AppState, endpoint_id: i64) -> Result<()> {
+    DeactivateEndpointCommand { endpoint_id }
+        .execute_with_db(app_state.db_router.writer())
+        .await?;
+    Ok(())
+}
+
+fn parse_retry_after_header(
+    value: Option<&reqwest::header::HeaderValue>,
+) -> Option<std::time::Duration> {
+    let raw = value?.to_str().ok()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return Some(std::time::Duration::from_secs(seconds.max(1)));
+    }
+
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(raw) {
+        let now = Utc::now();
+        let target = dt.with_timezone(&Utc);
+        let delta_seconds = (target - now).num_seconds();
+        if delta_seconds > 0 {
+            return Some(std::time::Duration::from_secs(delta_seconds as u64));
+        }
+    }
+
+    None
+}
+
+pub async fn process_webhook_delivery(
+    delivery_id: i64,
+    deployment_id: i64,
+    app_state: &AppState,
+) -> Result<DeliveryResult> {
+    let command = GetActiveDeliveryCommand { delivery_id };
+    let delivery = match command
+        .execute_with_db(app_state.db_router.writer())
+        .await?
+    {
+        Some(d) => d,
+        None => {
+            warn!("Webhook delivery {} not found", delivery_id);
+            return Ok(DeliveryResult::NotFound);
+        }
+    };
+
+    let payload = match delivery.payload {
+        Some(payload_value) => payload_value,
+        None => {
+            warn!("Webhook delivery {} has no payload", delivery_id);
+            return Ok(DeliveryResult::NotFound);
+        }
+    };
+
+    let event_timestamp = chrono::DateTime::<Utc>::from_timestamp(delivery.webhook_timestamp, 0)
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let outbound_payload = json!({
+        "type": delivery.event_name,
+        "timestamp": event_timestamp,
+        "data": payload,
+    });
+
+    if let Some(filter_rules) = &delivery.filter_rules {
+        let filter_match = evaluate_filter(filter_rules, &payload);
+        if !filter_match {
+            let payload_json = serde_json::to_string(&outbound_payload).unwrap_or_default();
+            let ch_delivery = build_webhook_log(
+                deployment_id,
+                delivery_id,
+                &delivery.app_slug,
+                delivery.endpoint_id,
+                &delivery.event_name,
+                "filtered",
+                None,
+                None,
+                delivery.attempts,
+                delivery.max_attempts,
+                Some(payload_json),
+                None,
+                None,
+            );
+
+            log_and_delete_active_delivery(
+                app_state,
+                &ch_delivery,
+                "filtered delivery",
+                delivery_id,
+            )
+            .await?;
+            return Ok(DeliveryResult::Success);
+        }
+    }
+
+    if let Some(rate_limit_config) = &delivery.rate_limit_config {
+        let config: models::webhook::RateLimitConfig =
+            serde_json::from_value(rate_limit_config.clone())
+                .map_err(|e| anyhow::anyhow!("Invalid rate limit config: {}", e))?;
+
+        let throttler = crate::throttler::WebhookThrottler::new(app_state.redis_client.clone());
+
+        match throttler
+            .check_and_record(
+                delivery.endpoint_id,
+                config.duration_ms,
+                config.max_requests,
+            )
+            .await?
+        {
+            None => {}
+            Some(delay_ms) => {
+                return Ok(DeliveryResult::RetryAfter(
+                    std::time::Duration::from_millis(delay_ms as u64),
+                ));
+            }
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            delivery.timeout_seconds as u64,
+        ))
+        .user_agent("Wacht-Webhook/1.0")
+        .build()?;
+
+    let payload_json = serde_json::to_string(&outbound_payload).unwrap_or_default();
+
+    let mut request = client.post(&delivery.url).json(&outbound_payload);
+
+    let mut final_headers = std::collections::HashMap::new();
+    final_headers.insert("webhook-id".to_string(), delivery.webhook_id.clone());
+    final_headers.insert(
+        "webhook-timestamp".to_string(),
+        delivery.webhook_timestamp.to_string(),
+    );
+    let signature = generate_webhook_signature(
+        &delivery.signing_secret,
+        &delivery.webhook_id,
+        delivery.webhook_timestamp,
+        &outbound_payload,
+    );
+    final_headers.insert("webhook-signature".to_string(), signature);
+
+    if let Some(headers) = &delivery.headers {
+        if let Some(headers_obj) = headers.as_object() {
+            for (key, value) in headers_obj {
+                if let Some(value_str) = value.as_str() {
+                    final_headers.insert(key.clone(), value_str.to_string());
+                }
+            }
+        }
+    }
+
+    let request_headers_json = serde_json::to_string(&final_headers).ok();
+
+    for (k, v) in &final_headers {
+        request = request.header(k, v);
+    }
+
+    let start = Instant::now();
+    let result = request.send().await;
+    let duration = start.elapsed();
+
+    match result {
+        Ok(response) => {
+            let status = response.status();
+            let status_code = status.as_u16();
+            let retry_after = parse_retry_after_header(response.headers().get(RETRY_AFTER));
+            let response_body = response.text().await.ok();
+
+            if status_code == 410 {
+                warn!(
+                    "Endpoint {} returned 410 Gone, permanently disabling endpoint",
+                    delivery.url
+                );
+
+                let ch_delivery = build_webhook_log(
+                    deployment_id,
+                    delivery_id,
+                    &delivery.app_slug,
+                    delivery.endpoint_id,
+                    &delivery.event_name,
+                    "endpoint_disabled",
+                    Some(410),
+                    Some(duration.as_millis() as i32),
+                    delivery.attempts + 1,
+                    delivery.max_attempts,
+                    Some(payload_json.clone()),
+                    response_body.clone(),
+                    request_headers_json.clone(),
+                );
+
+                log_and_delete_active_delivery(
+                    app_state,
+                    &ch_delivery,
+                    "410 Gone delivery",
+                    delivery_id,
+                )
+                .await?;
+
+                deactivate_endpoint(app_state, delivery.endpoint_id).await?;
+
+                if let Err(e) = send_webhook_failure_notification(
+                    deployment_id,
+                    &delivery.app_slug,
+                    delivery.endpoint_id,
+                    &delivery.url,
+                    app_state,
+                )
+                .await
+                {
+                    warn!(
+                        "Failed to send webhook endpoint failure notification for endpoint {}: {}",
+                        delivery.endpoint_id, e
+                    );
+                }
+
+                return Ok(DeliveryResult::Failed);
+            }
+
+            if status.is_success() {
+                let ch_delivery = build_webhook_log(
+                    deployment_id,
+                    delivery_id,
+                    &delivery.app_slug,
+                    delivery.endpoint_id,
+                    &delivery.event_name,
+                    "success",
+                    Some(status_code as i32),
+                    Some(duration.as_millis() as i32),
+                    delivery.attempts + 1,
+                    delivery.max_attempts,
+                    Some(payload_json.clone()),
+                    response_body.clone(),
+                    request_headers_json.clone(),
+                );
+
+                log_and_delete_active_delivery(
+                    app_state,
+                    &ch_delivery,
+                    "successful delivery",
+                    delivery_id,
+                )
+                .await?;
+
+                Ok(DeliveryResult::Success)
+            } else {
+                warn!(
+                    "Webhook {} returned non-success status: {}",
+                    delivery_id, status
+                );
+
+                let will_retry = (delivery.attempts + 1) < delivery.max_attempts
+                    && (status_code >= 500 || status_code == 408 || status_code == 429);
+
+                let ch_delivery = build_webhook_log(
+                    deployment_id,
+                    delivery_id,
+                    &delivery.app_slug,
+                    delivery.endpoint_id,
+                    &delivery.event_name,
+                    failure_status_label(will_retry),
+                    Some(status_code as i32),
+                    Some(duration.as_millis() as i32),
+                    delivery.attempts + 1,
+                    delivery.max_attempts,
+                    Some(payload_json.clone()),
+                    response_body.clone(),
+                    request_headers_json.clone(),
+                );
+
+                log_failure_and_handle(
+                    app_state,
+                    FailureContext {
+                        delivery_id,
+                        deployment_id,
+                        app_slug: delivery.app_slug.clone(),
+                        endpoint_id: delivery.endpoint_id,
+                        endpoint_url: delivery.url.clone(),
+                        new_attempts: delivery.attempts + 1,
+                        max_attempts: delivery.max_attempts,
+                    },
+                    &ch_delivery,
+                    "failed delivery",
+                    Some(status_code),
+                    retry_after,
+                )
+                .await
+            }
+        }
+        Err(_e) => {
+            let will_retry = (delivery.attempts + 1) < delivery.max_attempts;
+            let ch_delivery = build_webhook_log(
+                deployment_id,
+                delivery_id,
+                &delivery.app_slug,
+                delivery.endpoint_id,
+                &delivery.event_name,
+                failure_status_label(will_retry),
+                None,
+                None,
+                delivery.attempts + 1,
+                delivery.max_attempts,
+                Some(payload_json.clone()),
+                None,
+                request_headers_json.clone(),
+            );
+
+            log_failure_and_handle(
+                app_state,
+                FailureContext {
+                    delivery_id,
+                    deployment_id,
+                    app_slug: delivery.app_slug,
+                    endpoint_id: delivery.endpoint_id,
+                    endpoint_url: delivery.url,
+                    new_attempts: delivery.attempts + 1,
+                    max_attempts: delivery.max_attempts,
+                },
+                &ch_delivery,
+                "error delivery",
+                None,
+                None,
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_delivery_failure(
+    delivery_id: i64,
+    deployment_id: i64,
+    app_slug: String,
+    endpoint_id: i64,
+    endpoint_url: String,
+    new_attempts: i32,
+    max_attempts: i32,
+    status_code: Option<u16>,
+    retry_after: Option<std::time::Duration>,
+    app_state: &AppState,
+) -> Result<DeliveryResult> {
+    let should_retry = new_attempts < max_attempts
+        && status_code.map_or(true, |s| {
+            s >= STATUS_INTERNAL_SERVER_ERROR
+                || s == STATUS_REQUEST_TIMEOUT
+                || s == STATUS_TOO_MANY_REQUESTS
+        });
+
+    if should_retry {
+        let retry_delay = if let Some(retry_after_duration) = retry_after {
+            retry_after_duration
+        } else {
+            let next_retry = calculate_next_retry(new_attempts);
+            std::time::Duration::from_secs((next_retry - Utc::now()).num_seconds().max(1) as u64)
+        };
+        let next_retry = Utc::now()
+            + chrono::Duration::from_std(retry_delay)
+                .unwrap_or_else(|_| chrono::Duration::hours(6));
+
+        UpdateDeliveryAttemptsCommand {
+            delivery_id,
+            new_attempts,
+            next_retry_at: next_retry,
+        }
+        .execute_with_db(app_state.db_router.writer())
+        .await?;
+
+        return Ok(DeliveryResult::RetryAfter(std::time::Duration::from_secs(
+            retry_delay.as_secs(),
+        )));
+    } else {
+        warn!(
+            "Max attempts reached for delivery {} or non-retryable error",
+            delivery_id
+        );
+        let redis_deps = common::deps::from_app(app_state).redis();
+
+        delete_active_delivery(app_state, delivery_id).await?;
+
+        if new_attempts >= max_attempts {
+            let failure_count = IncrementEndpointFailuresCommand { endpoint_id }
+                .execute_with_deps(&redis_deps)
+                .await?;
+
+            const DEACTIVATION_THRESHOLD: i64 = 10;
+            if failure_count >= DEACTIVATION_THRESHOLD {
+                warn!(
+                    "Auto-deactivating endpoint {} after {} max-attempt failures in 24 hours",
+                    endpoint_id, failure_count
+                );
+
+                deactivate_endpoint(app_state, endpoint_id).await?;
+
+                ClearEndpointFailuresCommand { endpoint_id }
+                    .execute_with_deps(&redis_deps)
+                    .await?;
+
+                if let Ok(log_id) = app_state.sf.next_id() {
+                    let ch_delivery = build_webhook_log(
+                        deployment_id,
+                        log_id as i64,
+                        &app_slug,
+                        endpoint_id,
+                        "endpoint.deactivated",
+                        "deactivated",
+                        None,
+                        None,
+                        0,
+                        0,
+                        None,
+                        None,
+                        None,
+                    );
+
+                    insert_webhook_log_safe(app_state, &ch_delivery, "endpoint deactivation").await;
+                } else {
+                    warn!("Failed to generate snowflake id for endpoint deactivation log");
+                }
+
+                if let Err(e) = send_webhook_failure_notification(
+                    deployment_id,
+                    &app_slug,
+                    endpoint_id,
+                    &endpoint_url,
+                    app_state,
+                )
+                .await
+                {
+                    warn!(
+                        "Failed to send webhook endpoint failure notification for endpoint {}: {}",
+                        endpoint_id, e
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(DeliveryResult::Failed)
+}
+
+async fn get_failure_notification_emails(
+    deployment_id: i64,
+    app_slug: &str,
+    app_state: &AppState,
+) -> Result<Vec<String>> {
+    let reader = app_state.db_router.reader(ReadConsistency::Strong);
+    let app = GetWebhookAppByNameQuery::new(deployment_id, app_slug.to_string())
+        .execute_with_db(reader)
+        .await?;
+
+    let Some(app) = app else {
+        return Ok(Vec::new());
+    };
+
+    let emails = app
+        .failure_notification_emails
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|email| !email.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+
+    Ok(emails)
+}
+
+async fn send_webhook_failure_notification(
+    deployment_id: i64,
+    app_slug: &str,
+    endpoint_id: i64,
+    endpoint_url: &str,
+    app_state: &AppState,
+) -> Result<()> {
+    let recipient_emails =
+        get_failure_notification_emails(deployment_id, app_slug, app_state).await?;
+
+    if recipient_emails.is_empty() {
+        return Ok(());
+    }
+
+    let mut redis_conn = app_state
+        .redis_client
+        .get_multiplexed_async_connection()
+        .await?;
+    let email_deps = common::deps::from_app(app_state)
+        .db()
+        .enc()
+        .email()
+        .template();
+
+    for recipient_email in recipient_emails {
+        let dedupe_key = format!(
+            "webhook:failure-notification:{}:{}:{}:{}",
+            deployment_id,
+            app_slug,
+            endpoint_id,
+            recipient_email.to_lowercase()
+        );
+
+        let lock_set: Option<String> = redis::cmd("SET")
+            .arg(&dedupe_key)
+            .arg("1")
+            .arg("NX")
+            .arg("EX")
+            .arg(WEBHOOK_FAILURE_EMAIL_COOLDOWN_SECONDS)
+            .query_async(&mut redis_conn)
+            .await?;
+
+        if lock_set.is_none() {
+            continue;
+        }
+
+        let variables = serde_json::json!({
+            "endpoint": {
+                "url": endpoint_url,
+            },
+        });
+
+        let send_email_command = SendEmailCommand::new(
+            deployment_id,
+            "webhook_failure_notification_template".to_string(),
+            recipient_email.clone(),
+            variables,
+        );
+        if let Err(e) = send_email_command.execute_with_deps(&email_deps).await {
+            error!(
+                deployment_id,
+                app_slug,
+                endpoint_id,
+                recipient = %recipient_email,
+                "Failed to send webhook failure notification email: {}",
+                e
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn process_webhook_batch(
+    delivery_ids: Vec<i64>,
+    deployment_id: i64,
+    app_state: &AppState,
+) -> Result<String> {
+    if delivery_ids.is_empty() {
+        return Ok("No deliveries to process".to_string());
+    }
+
+    let mut successful = 0;
+    let mut failed = 0;
+    let mut not_found = 0;
+
+    const PARALLEL_LIMIT: usize = 50;
+
+    for chunk in delivery_ids.chunks(PARALLEL_LIMIT) {
+        let mut handles = Vec::new();
+
+        for &delivery_id in chunk {
+            let app_state_clone = app_state.clone();
+            let handle = tokio::spawn(async move {
+                process_webhook_delivery(delivery_id, deployment_id, &app_state_clone).await
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(result)) => match result {
+                    DeliveryResult::Success => successful += 1,
+                    DeliveryResult::Failed => failed += 1,
+                    DeliveryResult::NotFound => not_found += 1,
+                    DeliveryResult::RetryAfter(_) => failed += 1,
+                },
+                Ok(Err(e)) => {
+                    error!("Webhook delivery error: {}", e);
+                    failed += 1;
+                }
+                Err(e) => {
+                    error!("Task join error: {}", e);
+                    failed += 1;
+                }
+            }
+        }
+    }
+
+    Ok(format!(
+        "Batch processed: {} successful, {} failed, {} not found",
+        successful, failed, not_found
+    ))
+}
+
+pub async fn process_webhook_retry(
+    delivery_id: i64,
+    deployment_id: i64,
+    app_state: &AppState,
+) -> Result<String> {
+    use crate::tasks::webhook_replay::replay_webhook_delivery;
+
+    let new_delivery_id = replay_webhook_delivery(app_state, delivery_id, deployment_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to replay webhook delivery: {}", e))?;
+
+    Ok(format!(
+        "Webhook delivery {} retried as new delivery {}",
+        delivery_id, new_delivery_id
+    ))
+}

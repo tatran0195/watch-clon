@@ -1,0 +1,1243 @@
+use std::str::FromStr;
+
+use common::error::AppError;
+use dto::params::deployment::DeploymentNameParams;
+use models::{
+    DeploymentAuthSettings, DeploymentB2bSettings, DeploymentB2bSettingsWithRoles,
+    DeploymentJwtTemplate, DeploymentMode, DeploymentOrganizationRole, DeploymentRestrictions,
+    DeploymentSocialConnection, DeploymentUISettings, DeploymentWithSettings,
+    DeploymentWorkspaceRole, EmailTemplate, FirstFactor, OauthCredentials, SecondFactorPolicy,
+};
+use serde::de::DeserializeOwned;
+use sqlx::{Row, query};
+
+fn parse_json<T: DeserializeOwned>(value: serde_json::Value, field: &str) -> Result<T, AppError> {
+    serde_json::from_value(value)
+        .map_err(|e| AppError::Internal(format!("Invalid {} JSON: {}", field, e)))
+}
+
+fn parse_optional_json<T: DeserializeOwned>(
+    value: Option<serde_json::Value>,
+    field: &str,
+) -> Result<Option<T>, AppError> {
+    match value {
+        Some(v) => serde_json::from_value::<Option<T>>(v)
+            .map_err(|e| AppError::Internal(format!("Invalid {} JSON: {}", field, e))),
+        None => Ok(None),
+    }
+}
+
+fn parse_json_or_default<T: DeserializeOwned + Default>(
+    value: Option<serde_json::Value>,
+    field: &str,
+) -> Result<T, AppError> {
+    parse_json(value.unwrap_or_default(), field)
+}
+
+fn require_opt<T>(value: Option<T>, field: &str) -> Result<T, AppError> {
+    value.ok_or_else(|| AppError::Internal(format!("Missing required field: {}", field)))
+}
+
+fn parse_enum<T>(value: &str, field: &str) -> Result<T, AppError>
+where
+    T: FromStr,
+{
+    T::from_str(value).map_err(|_| AppError::Internal(format!("Invalid {field}: {value}")))
+}
+
+fn parse_json_badreq<T: DeserializeOwned>(
+    value: serde_json::Value,
+    field: &str,
+) -> Result<T, AppError> {
+    serde_json::from_value(value)
+        .map_err(|e| AppError::BadRequest(format!("Failed to parse {field}: {e}")))
+}
+
+fn parse_enum_or_default<T>(value: &str, default: T, field: &str) -> Result<T, AppError>
+where
+    T: FromStr,
+    <T as FromStr>::Err: std::fmt::Display,
+{
+    if value.trim().is_empty() {
+        return Ok(default);
+    }
+    T::from_str(value)
+        .map_err(|e| AppError::BadRequest(format!("Failed to parse {field} '{value}': {e}")))
+}
+
+pub struct GetDeploymentIdByBackendHostQuery {
+    backend_host: String,
+}
+
+impl GetDeploymentIdByBackendHostQuery {
+    pub fn new(backend_host: String) -> Self {
+        Self { backend_host }
+    }
+
+    pub async fn execute_with_db<'e, E>(&self, executor: E) -> Result<i64, AppError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        let row = query!(
+            "SELECT id FROM deployments WHERE backend_host = $1 AND deleted_at IS NULL",
+            self.backend_host
+        )
+        .fetch_optional(executor)
+        .await?;
+
+        let row = row.ok_or_else(|| AppError::NotFound("Deployment not found".to_string()))?;
+        Ok(row.id)
+    }
+}
+
+pub struct GetDeploymentWithKeyPairQuery {
+    backend_host: String,
+}
+
+impl GetDeploymentWithKeyPairQuery {
+    pub fn new(backend_host: String) -> Self {
+        Self { backend_host }
+    }
+
+    pub async fn execute_with_db<'e, E>(&self, executor: E) -> Result<(i64, String), AppError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        let row = query!(
+            r#"
+            SELECT d.id, kp.public_key as "public_key?"
+            FROM deployments d
+            LEFT JOIN deployment_key_pairs kp ON d.id = kp.deployment_id
+            WHERE d.backend_host = $1 AND d.deleted_at IS NULL
+            "#,
+            self.backend_host
+        )
+        .fetch_optional(executor)
+        .await?;
+
+        let row = row.ok_or_else(|| AppError::NotFound("Deployment not found".to_string()))?;
+
+        let public_key = row
+            .public_key
+            .ok_or_else(|| AppError::NotFound("Deployment key pair not found".to_string()))?;
+
+        Ok((row.id, public_key))
+    }
+}
+
+pub struct GetDeploymentWithSettingsQuery {
+    deployment_id: i64,
+}
+
+impl GetDeploymentWithSettingsQuery {
+    pub fn new(deployment_id: i64) -> Self {
+        Self { deployment_id }
+    }
+
+    pub async fn execute_with_db<'e, E>(
+        &self,
+        executor: E,
+    ) -> Result<DeploymentWithSettings, AppError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        let row = query!(
+            r#"
+            SELECT
+                deployments.id,
+                deployments.created_at,
+                deployments.updated_at,
+                deployments.maintenance_mode,
+                deployments.backend_host,
+                deployments.frontend_host,
+                deployments.publishable_key,
+                deployments.mode,
+                deployments.mail_from_host,
+                deployments.domain_verification_records::jsonb as domain_verification_records,
+                deployments.email_verification_records::jsonb as email_verification_records,
+                deployments.email_provider,
+                deployments.custom_smtp_config::jsonb as custom_smtp_config,
+
+                deployment_auth_settings.id as "auth_settings_id?",
+                deployment_auth_settings.created_at as "auth_settings_created_at?",
+                deployment_auth_settings.updated_at as "auth_settings_updated_at?",
+                deployment_auth_settings.email_address::jsonb as "email_address?",
+                deployment_auth_settings.phone_number::jsonb as "phone_number?",
+                deployment_auth_settings.username::jsonb as username,
+                deployment_auth_settings.first_name::jsonb as first_name,
+                deployment_auth_settings.last_name::jsonb as last_name,
+                deployment_auth_settings.password::jsonb as password,
+                deployment_auth_settings.auth_factors_enabled::jsonb as auth_factors_enabled,
+                deployment_auth_settings.verification_policy::jsonb as verification_policy,
+                deployment_auth_settings.second_factor_policy::text as second_factor_policy,
+                deployment_auth_settings.first_factor::text as first_factor,
+                deployment_auth_settings.passkey::jsonb as passkey,
+                deployment_auth_settings.magic_link::jsonb as magic_link,
+                deployment_auth_settings.multi_session_support::jsonb as multi_session_support,
+                deployment_auth_settings.session_token_lifetime,
+                deployment_auth_settings.session_validity_period,
+                deployment_auth_settings.session_inactive_timeout,
+
+                deployment_ui_settings.id as "ui_settings_id?",
+                deployment_ui_settings.created_at as "ui_settings_created_at?",
+                deployment_ui_settings.updated_at as "ui_settings_updated_at?",
+                deployment_ui_settings.app_name,
+                deployment_ui_settings.tos_page_url,
+                deployment_ui_settings.sign_in_page_url,
+                deployment_ui_settings.sign_up_page_url,
+                deployment_ui_settings.after_sign_out_one_page_url,
+                deployment_ui_settings.after_sign_out_all_page_url,
+                deployment_ui_settings.favicon_image_url,
+                deployment_ui_settings.logo_image_url,
+                deployment_ui_settings.privacy_policy_url,
+                deployment_ui_settings.signup_terms_statement,
+                deployment_ui_settings.signup_terms_statement_shown,
+                deployment_ui_settings.theme_tokens,
+                deployment_ui_settings.after_logo_click_url,
+                deployment_ui_settings.organization_profile_url,
+                deployment_ui_settings.create_organization_url,
+                deployment_ui_settings.default_user_profile_image_url,
+                deployment_ui_settings.default_organization_profile_image_url,
+                deployment_ui_settings.default_workspace_profile_image_url,
+                deployment_ui_settings.use_initials_for_user_profile_image,
+                deployment_ui_settings.use_initials_for_organization_profile_image,
+                deployment_ui_settings.after_signup_redirect_url,
+                deployment_ui_settings.after_signin_redirect_url,
+                deployment_ui_settings.user_profile_url,
+                deployment_ui_settings.after_create_organization_redirect_url,
+                deployment_ui_settings.waitlist_page_url,
+                deployment_ui_settings.support_page_url,
+
+                deployment_b2b_settings.id as "b2b_settings_id?",
+                deployment_b2b_settings.created_at as "b2b_settings_created_at?",
+                deployment_b2b_settings.updated_at as "b2b_settings_updated_at?",
+                deployment_b2b_settings.organizations_enabled as "b2b_settings_organizations_enabled?",
+                deployment_b2b_settings.workspaces_enabled as "b2b_settings_workspaces_enabled?",
+                deployment_b2b_settings.ip_allowlist_per_org_enabled as "b2b_settings_ip_allowlist_per_org_enabled?",
+                deployment_b2b_settings.max_allowed_org_members as "b2b_settings_max_allowed_org_members?",
+                deployment_b2b_settings.max_allowed_workspace_members as "b2b_settings_max_allowed_workspace_members?",
+                deployment_b2b_settings.allow_org_deletion as "b2b_settings_allow_org_deletion?",
+                deployment_b2b_settings.allow_workspace_deletion as "b2b_settings_allow_workspace_deletion?",
+                deployment_b2b_settings.custom_org_role_enabled as "b2b_settings_custom_org_role_enabled?",
+                deployment_b2b_settings.custom_workspace_role_enabled as "b2b_settings_custom_workspace_role_enabled?",
+                deployment_b2b_settings.limit_org_creation_per_user as "b2b_settings_limit_org_creation_per_user?",
+                deployment_b2b_settings.limit_workspace_creation_per_org as "b2b_settings_limit_workspace_creation_per_org?",
+                deployment_b2b_settings.org_creation_per_user_count as "b2b_settings_org_creation_per_user_count?",
+                deployment_b2b_settings.workspaces_per_org_count as "b2b_settings_workspaces_per_org_count?",
+                deployment_b2b_settings.allow_users_to_create_orgs as "b2b_settings_allow_users_to_create_orgs?",
+                deployment_b2b_settings.max_orgs_per_user as "b2b_settings_max_orgs_per_user?",
+                deployment_b2b_settings.default_workspace_creator_role_id as "b2b_settings_default_workspace_creator_role_id?",
+                deployment_b2b_settings.default_workspace_member_role_id as "b2b_settings_default_workspace_member_role_id?",
+                deployment_b2b_settings.default_org_creator_role_id as "b2b_settings_default_org_creator_role_id?",
+                deployment_b2b_settings.default_org_member_role_id as "b2b_settings_default_org_member_role_id?",
+                deployment_b2b_settings.workspace_permissions as "b2b_settings_workspace_permissions?",
+                deployment_b2b_settings.organization_permissions as "b2b_settings_organization_permissions?",
+                deployment_b2b_settings.workspace_permission_catalog as "b2b_settings_workspace_permission_catalog?",
+                deployment_b2b_settings.organization_permission_catalog as "b2b_settings_organization_permission_catalog?",
+                deployment_b2b_settings.ip_allowlist_per_workspace_enabled as "b2b_settings_ip_allowlist_per_workspace_enabled?",
+                deployment_b2b_settings.enforce_mfa_per_org_enabled as "b2b_settings_enforce_mfa_per_org_enabled?",
+                deployment_b2b_settings.enforce_mfa_per_workspace_enabled as "b2b_settings_enforce_mfa_per_workspace_enabled?",
+                deployment_b2b_settings.enterprise_sso_enabled as "b2b_settings_enterprise_sso_enabled?",
+
+                deployment_default_workspace_creator_role.created_at as "default_workspace_creator_role_created_at?",
+                deployment_default_workspace_creator_role.updated_at as "default_workspace_creator_role_updated_at?",
+                deployment_default_workspace_creator_role.name as "default_workspace_creator_role_name?",
+                deployment_default_workspace_creator_role.permissions as "default_workspace_creator_role_permissions?",
+
+                deployment_default_workspace_member_role.created_at as "default_workspace_member_role_created_at?",
+                deployment_default_workspace_member_role.updated_at as "default_workspace_member_role_updated_at?",
+                deployment_default_workspace_member_role.name as "default_workspace_member_role_name?",
+                deployment_default_workspace_member_role.permissions as "default_workspace_member_role_permissions?",
+
+                deployment_default_org_creator_role.created_at as "default_org_creator_role_created_at?",
+                deployment_default_org_creator_role.updated_at as "default_org_creator_role_updated_at?",
+                deployment_default_org_creator_role.name as "default_org_creator_role_name?",
+                deployment_default_org_creator_role.permissions as "default_org_creator_role_permissions?",
+
+                deployment_default_org_member_role.created_at as "default_org_member_role_created_at?",
+                deployment_default_org_member_role.updated_at as "default_org_member_role_updated_at?",
+                deployment_default_org_member_role.name as "default_org_member_role_name?",
+                deployment_default_org_member_role.permissions as "default_org_member_role_permissions?",
+
+                deployment_restrictions.id as "restrictions_id?",
+                deployment_restrictions.created_at as "restrictions_created_at?",
+                deployment_restrictions.updated_at as "restrictions_updated_at?",
+                deployment_restrictions.allowlist_enabled,
+                deployment_restrictions.blocklist_enabled,
+                deployment_restrictions.block_subaddresses,
+                deployment_restrictions.block_disposable_emails,
+                deployment_restrictions.block_voip_numbers,
+                deployment_restrictions.country_restrictions,
+                deployment_restrictions.banned_keywords,
+                deployment_restrictions.allowlisted_resources,
+                deployment_restrictions.blocklisted_resources,
+                deployment_restrictions.sign_up_mode,
+                deployment_restrictions.waitlist_collect_names
+
+            FROM deployments
+            LEFT JOIN deployment_auth_settings
+                ON deployments.id = deployment_auth_settings.deployment_id
+            LEFT JOIN deployment_ui_settings
+                ON deployments.id = deployment_ui_settings.deployment_id
+            LEFT JOIN deployment_restrictions
+                ON deployments.id = deployment_restrictions.deployment_id
+            LEFT JOIN deployment_b2b_settings
+                ON deployments.id = deployment_b2b_settings.deployment_id
+            LEFT JOIN workspace_roles AS deployment_default_workspace_creator_role
+                ON deployment_default_workspace_creator_role.id = deployment_b2b_settings.default_workspace_creator_role_id
+            LEFT JOIN workspace_roles AS deployment_default_workspace_member_role
+                ON deployment_default_workspace_member_role.id = deployment_b2b_settings.default_workspace_member_role_id
+            LEFT JOIN organization_roles AS deployment_default_org_creator_role
+                ON deployment_default_org_creator_role.id = deployment_b2b_settings.default_org_creator_role_id
+            LEFT JOIN organization_roles AS deployment_default_org_member_role
+                ON deployment_default_org_member_role.id = deployment_b2b_settings.default_org_member_role_id
+            WHERE deployments.id = $1 AND deployments.deleted_at IS NULL
+            "#,
+            self.deployment_id,
+        )
+        .fetch_one(executor)
+        .await?;
+
+        let mode = match row.mode.as_str() {
+            "production" => DeploymentMode::Production,
+            "staging" => DeploymentMode::Staging,
+            _ => {
+                return Err(AppError::Database(sqlx::Error::Protocol(format!(
+                    "Invalid deployment mode: {}",
+                    row.mode
+                ))));
+            }
+        };
+
+        let auth_settings = if row.auth_settings_id.is_some() {
+            let auth_settings_id = require_opt(row.auth_settings_id, "auth_settings_id")?;
+            Some(DeploymentAuthSettings {
+                id: auth_settings_id,
+                created_at: row.auth_settings_created_at,
+                updated_at: row.auth_settings_updated_at,
+                email_address: parse_json_or_default(row.email_address, "email_address")?,
+                phone_number: parse_json_or_default(row.phone_number, "phone_number")?,
+                username: parse_json(row.username, "username")?,
+                first_name: parse_json(row.first_name, "first_name")?,
+                last_name: parse_json(row.last_name, "last_name")?,
+                password: parse_json(row.password, "password")?,
+                auth_factors_enabled: parse_json(row.auth_factors_enabled, "auth_factors_enabled")?,
+                verification_policy: parse_json(row.verification_policy, "verification_policy")?,
+                passkey: parse_json(row.passkey, "passkey")?,
+                magic_link: parse_json(row.magic_link, "magic_link")?,
+                second_factor_policy: parse_enum(
+                    &row.second_factor_policy,
+                    "second_factor_policy",
+                )?,
+                first_factor: parse_enum(&row.first_factor, "first_factor")?,
+                deployment_id: self.deployment_id,
+                multi_session_support: parse_json(
+                    row.multi_session_support,
+                    "multi_session_support",
+                )?,
+                session_token_lifetime: row.session_token_lifetime,
+                session_validity_period: row.session_validity_period,
+                session_inactive_timeout: row.session_inactive_timeout,
+            })
+        } else {
+            None
+        };
+
+        let ui_settings = if row.ui_settings_id.is_some() {
+            let ui_settings_id = require_opt(row.ui_settings_id, "ui_settings_id")?;
+            Some(DeploymentUISettings {
+                id: ui_settings_id,
+                created_at: row.ui_settings_created_at,
+                updated_at: row.ui_settings_updated_at,
+                deployment_id: self.deployment_id,
+                app_name: row.app_name,
+                tos_page_url: row.tos_page_url,
+                sign_in_page_url: row.sign_in_page_url,
+                sign_up_page_url: row.sign_up_page_url,
+                after_sign_out_one_page_url: row.after_sign_out_one_page_url,
+                after_sign_out_all_page_url: row.after_sign_out_all_page_url,
+                favicon_image_url: row.favicon_image_url,
+                logo_image_url: row.logo_image_url,
+                privacy_policy_url: row.privacy_policy_url,
+                signup_terms_statement: row.signup_terms_statement,
+                signup_terms_statement_shown: row.signup_terms_statement_shown,
+                theme_tokens: match row.theme_tokens {
+                    Some(v) => Some(parse_json(v, "theme_tokens")?),
+                    None => None,
+                },
+                after_logo_click_url: row.after_logo_click_url,
+                organization_profile_url: row.organization_profile_url,
+                create_organization_url: row.create_organization_url,
+                default_user_profile_image_url: row.default_user_profile_image_url,
+                default_organization_profile_image_url: row.default_organization_profile_image_url,
+                default_workspace_profile_image_url: row.default_workspace_profile_image_url,
+                use_initials_for_user_profile_image: row.use_initials_for_user_profile_image,
+                use_initials_for_organization_profile_image: row
+                    .use_initials_for_organization_profile_image,
+                after_signup_redirect_url: row.after_signup_redirect_url,
+                after_signin_redirect_url: row.after_signin_redirect_url,
+                user_profile_url: row.user_profile_url,
+                after_create_organization_redirect_url: row.after_create_organization_redirect_url,
+                waitlist_page_url: row.waitlist_page_url,
+                support_page_url: row.support_page_url,
+            })
+        } else {
+            None
+        };
+
+        let restrictions = if row.restrictions_id.is_some() {
+            let restrictions_id = require_opt(row.restrictions_id, "restrictions_id")?;
+            Some(DeploymentRestrictions {
+                id: restrictions_id,
+                created_at: row.restrictions_created_at,
+                updated_at: row.restrictions_updated_at,
+                deployment_id: self.deployment_id,
+                allowlist_enabled: row.allowlist_enabled,
+                blocklist_enabled: row.blocklist_enabled,
+                block_subaddresses: row.block_subaddresses,
+                block_disposable_emails: row.block_disposable_emails,
+                block_voip_numbers: row.block_voip_numbers,
+                country_restrictions: parse_json(row.country_restrictions, "country_restrictions")?,
+                banned_keywords: row.banned_keywords,
+                allowlisted_resources: row.allowlisted_resources,
+                blocklisted_resources: row.blocklisted_resources,
+                sign_up_mode: parse_enum(&row.sign_up_mode, "sign_up_mode")?,
+                waitlist_collect_names: row.waitlist_collect_names,
+            })
+        } else {
+            None
+        };
+
+        Ok(DeploymentWithSettings {
+            id: row.id,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            maintenance_mode: row.maintenance_mode,
+            backend_host: row.backend_host,
+            frontend_host: row.frontend_host,
+            publishable_key: row.publishable_key,
+            mail_from_host: row.mail_from_host,
+            mode,
+            auth_settings,
+            ui_settings,
+            restrictions,
+            b2b_settings: if row.b2b_settings_id.is_some() {
+                let b2b_settings_id = require_opt(row.b2b_settings_id, "b2b_settings_id")?;
+                let b2b_settings_created_at =
+                    require_opt(row.b2b_settings_created_at, "b2b_settings_created_at")?;
+                let b2b_settings_updated_at =
+                    require_opt(row.b2b_settings_updated_at, "b2b_settings_updated_at")?;
+                let organizations_enabled = require_opt(
+                    row.b2b_settings_organizations_enabled,
+                    "b2b_settings_organizations_enabled",
+                )?;
+                let workspaces_enabled = require_opt(
+                    row.b2b_settings_workspaces_enabled,
+                    "b2b_settings_workspaces_enabled",
+                )?;
+                let ip_allowlist_per_org_enabled = require_opt(
+                    row.b2b_settings_ip_allowlist_per_org_enabled,
+                    "b2b_settings_ip_allowlist_per_org_enabled",
+                )?;
+                let max_allowed_org_members = require_opt(
+                    row.b2b_settings_max_allowed_org_members,
+                    "b2b_settings_max_allowed_org_members",
+                )?;
+                let max_allowed_workspace_members = require_opt(
+                    row.b2b_settings_max_allowed_workspace_members,
+                    "b2b_settings_max_allowed_workspace_members",
+                )?;
+                let allow_org_deletion = require_opt(
+                    row.b2b_settings_allow_org_deletion,
+                    "b2b_settings_allow_org_deletion",
+                )?;
+                let allow_workspace_deletion = require_opt(
+                    row.b2b_settings_allow_workspace_deletion,
+                    "b2b_settings_allow_workspace_deletion",
+                )?;
+                let custom_org_role_enabled = require_opt(
+                    row.b2b_settings_custom_org_role_enabled,
+                    "b2b_settings_custom_org_role_enabled",
+                )?;
+                let custom_workspace_role_enabled = require_opt(
+                    row.b2b_settings_custom_workspace_role_enabled,
+                    "b2b_settings_custom_workspace_role_enabled",
+                )?;
+                let default_workspace_creator_role_id = require_opt(
+                    row.b2b_settings_default_workspace_creator_role_id,
+                    "b2b_settings_default_workspace_creator_role_id",
+                )?;
+                let default_workspace_member_role_id = require_opt(
+                    row.b2b_settings_default_workspace_member_role_id,
+                    "b2b_settings_default_workspace_member_role_id",
+                )?;
+                let default_org_creator_role_id = require_opt(
+                    row.b2b_settings_default_org_creator_role_id,
+                    "b2b_settings_default_org_creator_role_id",
+                )?;
+                let default_org_member_role_id = require_opt(
+                    row.b2b_settings_default_org_member_role_id,
+                    "b2b_settings_default_org_member_role_id",
+                )?;
+                let limit_org_creation_per_user = require_opt(
+                    row.b2b_settings_limit_org_creation_per_user,
+                    "b2b_settings_limit_org_creation_per_user",
+                )?;
+                let limit_workspace_creation_per_org = require_opt(
+                    row.b2b_settings_limit_workspace_creation_per_org,
+                    "b2b_settings_limit_workspace_creation_per_org",
+                )?;
+                let org_creation_per_user_count = require_opt(
+                    row.b2b_settings_org_creation_per_user_count,
+                    "b2b_settings_org_creation_per_user_count",
+                )?;
+                let workspaces_per_org_count = require_opt(
+                    row.b2b_settings_workspaces_per_org_count,
+                    "b2b_settings_workspaces_per_org_count",
+                )?;
+                let allow_users_to_create_orgs = require_opt(
+                    row.b2b_settings_allow_users_to_create_orgs,
+                    "b2b_settings_allow_users_to_create_orgs",
+                )?;
+                let max_orgs_per_user = require_opt(
+                    row.b2b_settings_max_orgs_per_user,
+                    "b2b_settings_max_orgs_per_user",
+                )?;
+                let workspace_permission_catalog = parse_optional_json(
+                    row.b2b_settings_workspace_permission_catalog,
+                    "b2b_settings_workspace_permission_catalog",
+                )?;
+                let organization_permission_catalog = parse_optional_json(
+                    row.b2b_settings_organization_permission_catalog,
+                    "b2b_settings_organization_permission_catalog",
+                )?;
+                let ip_allowlist_per_workspace_enabled = require_opt(
+                    row.b2b_settings_ip_allowlist_per_workspace_enabled,
+                    "b2b_settings_ip_allowlist_per_workspace_enabled",
+                )?;
+                let enforce_mfa_per_org_enabled = require_opt(
+                    row.b2b_settings_enforce_mfa_per_org_enabled,
+                    "b2b_settings_enforce_mfa_per_org_enabled",
+                )?;
+                let enforce_mfa_per_workspace_enabled = require_opt(
+                    row.b2b_settings_enforce_mfa_per_workspace_enabled,
+                    "b2b_settings_enforce_mfa_per_workspace_enabled",
+                )?;
+                let default_workspace_creator_role_created_at = require_opt(
+                    row.default_workspace_creator_role_created_at,
+                    "default_workspace_creator_role_created_at",
+                )?;
+                let default_workspace_creator_role_updated_at = require_opt(
+                    row.default_workspace_creator_role_updated_at,
+                    "default_workspace_creator_role_updated_at",
+                )?;
+                let default_workspace_member_role_created_at = require_opt(
+                    row.default_workspace_member_role_created_at,
+                    "default_workspace_member_role_created_at",
+                )?;
+                let default_workspace_member_role_updated_at = require_opt(
+                    row.default_workspace_member_role_updated_at,
+                    "default_workspace_member_role_updated_at",
+                )?;
+                let default_org_creator_role_created_at = require_opt(
+                    row.default_org_creator_role_created_at,
+                    "default_org_creator_role_created_at",
+                )?;
+                let default_org_creator_role_updated_at = require_opt(
+                    row.default_org_creator_role_updated_at,
+                    "default_org_creator_role_updated_at",
+                )?;
+                let default_org_member_role_created_at = require_opt(
+                    row.default_org_member_role_created_at,
+                    "default_org_member_role_created_at",
+                )?;
+                let default_org_member_role_updated_at = require_opt(
+                    row.default_org_member_role_updated_at,
+                    "default_org_member_role_updated_at",
+                )?;
+
+                let b2b_settings = DeploymentB2bSettings {
+                    id: b2b_settings_id,
+                    created_at: b2b_settings_created_at,
+                    updated_at: b2b_settings_updated_at,
+                    deployment_id: self.deployment_id,
+                    organizations_enabled,
+                    workspaces_enabled,
+                    ip_allowlist_per_org_enabled,
+                    max_allowed_org_members,
+                    max_allowed_workspace_members,
+                    allow_org_deletion,
+                    allow_workspace_deletion,
+                    custom_org_role_enabled,
+                    custom_workspace_role_enabled,
+                    default_workspace_creator_role_id,
+                    default_workspace_member_role_id,
+                    default_org_creator_role_id,
+                    default_org_member_role_id,
+                    limit_org_creation_per_user,
+                    limit_workspace_creation_per_org,
+                    org_creation_per_user_count,
+                    workspaces_per_org_count,
+                    allow_users_to_create_orgs,
+                    max_orgs_per_user,
+                    workspace_permissions: row.b2b_settings_workspace_permissions,
+                    organization_permissions: row.b2b_settings_organization_permissions,
+                    workspace_permission_catalog,
+                    organization_permission_catalog,
+                    ip_allowlist_per_workspace_enabled,
+                    enforce_mfa_per_org_enabled,
+                    enforce_mfa_per_workspace_enabled,
+                    enterprise_sso_enabled: row
+                        .b2b_settings_enterprise_sso_enabled
+                        .unwrap_or(false),
+                };
+                Some(DeploymentB2bSettingsWithRoles {
+                    settings: b2b_settings,
+                    default_workspace_creator_role: DeploymentWorkspaceRole {
+                        id: default_workspace_creator_role_id,
+                        created_at: default_workspace_creator_role_created_at,
+                        updated_at: default_workspace_creator_role_updated_at,
+                        name: row.default_workspace_creator_role_name.unwrap_or_default(),
+                        permissions: row
+                            .default_workspace_creator_role_permissions
+                            .unwrap_or_default(),
+                        deployment_id: self.deployment_id,
+                        organization_id: None,
+                        workspace_id: None,
+                    },
+                    default_workspace_member_role: DeploymentWorkspaceRole {
+                        id: default_workspace_member_role_id,
+                        created_at: default_workspace_member_role_created_at,
+                        updated_at: default_workspace_member_role_updated_at,
+                        name: row.default_workspace_member_role_name.unwrap_or_default(),
+                        permissions: row
+                            .default_workspace_member_role_permissions
+                            .unwrap_or_default(),
+                        deployment_id: self.deployment_id,
+                        organization_id: None,
+                        workspace_id: None,
+                    },
+                    default_org_creator_role: DeploymentOrganizationRole {
+                        id: default_org_creator_role_id,
+                        created_at: default_org_creator_role_created_at,
+                        updated_at: default_org_creator_role_updated_at,
+                        name: row.default_org_creator_role_name.unwrap_or_default(),
+                        permissions: row.default_org_creator_role_permissions.unwrap_or_default(),
+                        deployment_id: self.deployment_id,
+                        organization_id: None,
+                    },
+                    default_org_member_role: DeploymentOrganizationRole {
+                        id: default_org_member_role_id,
+                        created_at: default_org_member_role_created_at,
+                        updated_at: default_org_member_role_updated_at,
+                        name: row.default_org_member_role_name.unwrap_or_default(),
+                        permissions: row.default_org_member_role_permissions.unwrap_or_default(),
+                        deployment_id: self.deployment_id,
+                        organization_id: None,
+                    },
+                })
+            } else {
+                None
+            },
+            domain_verification_records: parse_optional_json(
+                row.domain_verification_records,
+                "domain_verification_records",
+            )?,
+            email_verification_records: parse_optional_json(
+                row.email_verification_records,
+                "email_verification_records",
+            )?,
+            email_provider: models::EmailProvider::from(row.email_provider),
+            custom_smtp_config: parse_optional_json(row.custom_smtp_config, "custom_smtp_config")?
+                .map(|mut c: models::CustomSmtpConfig| {
+                    c.password = String::new();
+                    c
+                }),
+        })
+    }
+}
+
+pub struct GetDeploymentSocialConnectionsQuery {
+    deployment_id: i64,
+}
+
+#[derive(Default)]
+pub struct GetDeploymentSocialConnectionsQueryBuilder {
+    deployment_id: Option<i64>,
+}
+
+impl GetDeploymentSocialConnectionsQuery {
+    pub fn builder() -> GetDeploymentSocialConnectionsQueryBuilder {
+        GetDeploymentSocialConnectionsQueryBuilder::default()
+    }
+
+    pub fn new(deployment_id: i64) -> Self {
+        Self { deployment_id }
+    }
+
+    pub async fn execute_with_db<'e, E>(
+        &self,
+        executor: E,
+    ) -> Result<Vec<DeploymentSocialConnection>, AppError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        let row = query!(
+            r#"
+            SELECT
+                id,
+                created_at,
+                updated_at,
+                deployment_id,
+                provider,
+                enabled,
+                credentials
+            FROM deployment_social_connections
+            WHERE deployment_id = $1
+            "#,
+            self.deployment_id,
+        )
+        .fetch_all(executor)
+        .await?;
+
+        row.into_iter()
+            .map(|row| -> Result<DeploymentSocialConnection, AppError> {
+                let provider = row
+                    .provider
+                    .map(|s| {
+                        models::SocialConnectionProvider::from_str(&s).map_err(|_| {
+                            AppError::Internal(format!("Invalid social provider value: {}", s))
+                        })
+                    })
+                    .transpose()?;
+
+                Ok(DeploymentSocialConnection {
+                    id: row.id,
+                    created_at: row.created_at,
+                    updated_at: row.updated_at,
+                    deployment_id: row.deployment_id,
+                    provider,
+                    enabled: row.enabled,
+                    credentials: row
+                        .credentials
+                        .map(|v| serde_json::from_value::<Option<OauthCredentials>>(v))
+                        .transpose()
+                        .map_err(|e| {
+                            AppError::Internal(format!("Invalid credentials JSON: {}", e))
+                        })?
+                        .flatten(),
+                })
+            })
+            .collect()
+    }
+}
+
+impl GetDeploymentSocialConnectionsQueryBuilder {
+    pub fn deployment_id(mut self, deployment_id: i64) -> Self {
+        self.deployment_id = Some(deployment_id);
+        self
+    }
+
+    pub fn build(self) -> Result<GetDeploymentSocialConnectionsQuery, AppError> {
+        Ok(GetDeploymentSocialConnectionsQuery {
+            deployment_id: self
+                .deployment_id
+                .ok_or_else(|| AppError::Validation("deployment_id is required".to_string()))?,
+        })
+    }
+}
+
+pub struct GetDeploymentJwtTemplatesQuery {
+    deployment_id: i64,
+}
+
+impl GetDeploymentJwtTemplatesQuery {
+    pub fn new(deployment_id: i64) -> Self {
+        Self { deployment_id }
+    }
+
+    pub async fn execute_with_db<'e, E>(
+        &self,
+        executor: E,
+    ) -> Result<Vec<DeploymentJwtTemplate>, AppError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        let row = query!(
+            r#"
+            SELECT
+                id,
+                created_at,
+                updated_at,
+                deployment_id,
+                name,
+                token_lifetime,
+                allowed_clock_skew,
+                custom_signing_key,
+                template
+            FROM deployment_jwt_templates
+            WHERE deployment_id = $1
+            "#,
+            self.deployment_id,
+        )
+        .fetch_all(executor)
+        .await?;
+
+        let templates = row
+            .into_iter()
+            .map(|row| -> Result<DeploymentJwtTemplate, AppError> {
+                Ok(DeploymentJwtTemplate {
+                    id: row.id,
+                    created_at: row.created_at,
+                    updated_at: row.updated_at,
+                    deployment_id: row.deployment_id,
+                    name: row.name,
+                    token_lifetime: row.token_lifetime,
+                    allowed_clock_skew: row.allowed_clock_skew,
+                    custom_signing_key: parse_optional_json(
+                        row.custom_signing_key,
+                        "custom_signing_key",
+                    )?,
+                    template: row.template,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(templates)
+    }
+}
+
+pub struct GetDeploymentEmailTemplateQuery {
+    deployment_id: i64,
+    template_name: DeploymentNameParams,
+}
+
+impl GetDeploymentEmailTemplateQuery {
+    pub fn new(deployment_id: i64, template_name: DeploymentNameParams) -> Self {
+        Self {
+            deployment_id,
+            template_name,
+        }
+    }
+
+    pub async fn execute_with_db<'e, E>(&self, executor: E) -> Result<EmailTemplate, AppError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        let template = match self.template_name {
+            DeploymentNameParams::OrganizationInviteTemplate => {
+                let row = query!(
+                    r#"
+                    SELECT organization_invite_template FROM deployment_email_templates WHERE deployment_id = $1
+                    "#,
+                    self.deployment_id,
+                )
+                .fetch_one(executor)
+                .await?;
+
+                row.organization_invite_template
+            }
+            DeploymentNameParams::VerificationCodeTemplate => {
+                let row = query!(
+                    r#"
+                    SELECT verification_code_template FROM deployment_email_templates WHERE deployment_id = $1
+                    "#,
+                    self.deployment_id,
+                )
+                .fetch_one(executor)
+                .await?;
+
+                row.verification_code_template
+            }
+            DeploymentNameParams::ResetPasswordCodeTemplate => {
+                let row = query!(
+                    r#"
+                    SELECT reset_password_code_template FROM deployment_email_templates WHERE deployment_id = $1
+                    "#,
+                    self.deployment_id,
+                )
+                .fetch_one(executor)
+                .await?;
+
+                row.reset_password_code_template
+            }
+            DeploymentNameParams::PrimaryEmailChangeTemplate => {
+                let row = query!(
+                    r#"
+                    SELECT primary_email_change_template FROM deployment_email_templates WHERE deployment_id = $1
+                    "#,
+                    self.deployment_id,
+                )
+                .fetch_one(executor)
+                .await?;
+
+                row.primary_email_change_template
+            }
+            DeploymentNameParams::PasswordChangeTemplate => {
+                let row = query!(
+                    r#"
+                    SELECT password_change_template FROM deployment_email_templates WHERE deployment_id = $1
+                    "#,
+                    self.deployment_id,
+                )
+                .fetch_one(executor)
+                .await?;
+
+                row.password_change_template
+            }
+            DeploymentNameParams::PasswordRemoveTemplate => {
+                let row = query!(
+                    r#"
+                    SELECT password_remove_template FROM deployment_email_templates WHERE deployment_id = $1
+                    "#,
+                    self.deployment_id,
+                )
+                .fetch_one(executor)
+                .await?;
+
+                row.password_remove_template
+            }
+            DeploymentNameParams::SignInFromNewDeviceTemplate => {
+                let row = query!(
+                    r#"
+                    SELECT sign_in_from_new_device_template FROM deployment_email_templates WHERE deployment_id = $1
+                    "#,
+                    self.deployment_id,
+                )
+                .fetch_one(executor)
+                .await?;
+
+                row.sign_in_from_new_device_template
+            }
+            DeploymentNameParams::MagicLinkTemplate => {
+                let row = query!(
+                    r#"
+                    SELECT magic_link_template FROM deployment_email_templates WHERE deployment_id = $1
+                    "#,
+                    self.deployment_id,
+                )
+                .fetch_one(executor)
+                .await?;
+
+                row.magic_link_template
+            }
+            DeploymentNameParams::WaitlistSignupTemplate => {
+                let row = query!(
+                    r#"
+                    SELECT waitlist_signup_template FROM deployment_email_templates WHERE deployment_id = $1
+                    "#,
+                    self.deployment_id,
+                )
+                .fetch_one(executor)
+                .await?;
+
+                row.waitlist_signup_template
+            }
+            DeploymentNameParams::WaitlistInviteTemplate => {
+                let row = query!(
+                    r#"
+                    SELECT waitlist_invite_template FROM deployment_email_templates WHERE deployment_id = $1
+                    "#,
+                    self.deployment_id,
+                )
+                .fetch_one(executor)
+                .await?;
+
+                row.waitlist_invite_template
+            }
+            DeploymentNameParams::WorkspaceInviteTemplate => {
+                let row = query!(
+                    r#"
+                    SELECT workspace_invite_template FROM deployment_email_templates WHERE deployment_id = $1
+                    "#,
+                    self.deployment_id,
+                )
+                .fetch_one(executor)
+                .await?;
+
+                row.workspace_invite_template
+            }
+            DeploymentNameParams::WebhookFailureNotificationTemplate => {
+                let row = query!(
+                    r#"
+                    SELECT webhook_failure_notification_template FROM deployment_email_templates WHERE deployment_id = $1
+                    "#,
+                    self.deployment_id,
+                )
+                .fetch_one(executor)
+                .await?;
+
+                row.webhook_failure_notification_template
+            }
+        };
+
+        Ok(serde_json::from_value(template)?)
+    }
+}
+
+// Helper query for getting specific email templates by name
+pub struct GetEmailTemplateByNameQuery {
+    deployment_id: i64,
+    template_name: String,
+}
+
+impl GetEmailTemplateByNameQuery {
+    pub fn new(deployment_id: i64, template_name: String) -> Self {
+        Self {
+            deployment_id,
+            template_name,
+        }
+    }
+
+    pub async fn execute_with_db<'e, E>(&self, executor: E) -> Result<EmailTemplate, AppError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        let column_name = match self.template_name.as_str() {
+            "organization_invite_template" => "organization_invite_template",
+            "verification_code_template" => "verification_code_template",
+            "reset_password_code_template" => "reset_password_code_template",
+            "primary_email_change_template" => "primary_email_change_template",
+            "password_change_template" => "password_change_template",
+            "password_remove_template" => "password_remove_template",
+            "sign_in_from_new_device_template" => "sign_in_from_new_device_template",
+            "magic_link_template" => "magic_link_template",
+            "waitlist_signup_template" => "waitlist_signup_template",
+            "waitlist_invite_template" => "waitlist_invite_template",
+            "workspace_invite_template" => "workspace_invite_template",
+            "webhook_failure_notification_template" => "webhook_failure_notification_template",
+            _ => {
+                return Err(AppError::BadRequest(
+                    "Invalid email template name".to_string(),
+                ));
+            }
+        };
+
+        let query_str = format!(
+            "SELECT {} FROM deployment_email_templates WHERE deployment_id = $1",
+            column_name
+        );
+
+        let row = sqlx::query(&query_str)
+            .bind(self.deployment_id)
+            .fetch_one(executor)
+            .await?;
+
+        let template_json: serde_json::Value = row.get(column_name);
+        let template: EmailTemplate = serde_json::from_value(template_json)
+            .map_err(|e| AppError::BadRequest(format!("Failed to parse email template: {}", e)))?;
+
+        Ok(template)
+    }
+}
+
+// Query for getting deployment auth settings
+pub struct GetDeploymentAuthSettingsQuery {
+    deployment_id: i64,
+}
+
+impl GetDeploymentAuthSettingsQuery {
+    pub fn new(deployment_id: i64) -> Self {
+        Self { deployment_id }
+    }
+
+    pub async fn execute_with_db<'e, E>(
+        &self,
+        executor: E,
+    ) -> Result<models::DeploymentAuthSettings, AppError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        let row = sqlx::query!(
+            r#"
+            SELECT
+                id, created_at, updated_at, deployment_id,
+                email_address, phone_number, username, first_name, last_name,
+                password, magic_link, passkey, auth_factors_enabled,
+                verification_policy, second_factor_policy, first_factor,
+                multi_session_support, session_token_lifetime, session_validity_period,
+                session_inactive_timeout
+            FROM deployment_auth_settings
+            WHERE deployment_id = $1
+            "#,
+            self.deployment_id
+        )
+        .fetch_one(executor)
+        .await?;
+
+        let auth_settings = models::DeploymentAuthSettings {
+            id: row.id,
+            created_at: Some(row.created_at),
+            updated_at: Some(row.updated_at),
+            deployment_id: row.deployment_id,
+            email_address: parse_json_badreq(row.email_address, "email_address")?,
+            phone_number: parse_json_badreq(row.phone_number, "phone_number")?,
+            username: parse_json_badreq(row.username, "username")?,
+            first_name: parse_json_badreq(row.first_name, "first_name")?,
+            last_name: parse_json_badreq(row.last_name, "last_name")?,
+            password: parse_json_badreq(row.password, "password")?,
+            magic_link: serde_json::from_value(row.magic_link).ok(),
+            passkey: serde_json::from_value(row.passkey).ok(),
+            auth_factors_enabled: parse_json_badreq(
+                row.auth_factors_enabled,
+                "auth_factors_enabled",
+            )?,
+            verification_policy: parse_json_badreq(row.verification_policy, "verification_policy")?,
+            second_factor_policy: parse_enum_or_default(
+                &row.second_factor_policy,
+                SecondFactorPolicy::Optional,
+                "second_factor_policy",
+            )?,
+            first_factor: parse_enum_or_default(
+                &row.first_factor,
+                FirstFactor::EmailPassword,
+                "first_factor",
+            )?,
+            multi_session_support: parse_json_badreq(
+                row.multi_session_support,
+                "multi_session_support",
+            )?,
+            session_token_lifetime: row.session_token_lifetime,
+            session_validity_period: row.session_validity_period,
+            session_inactive_timeout: row.session_inactive_timeout,
+        };
+
+        Ok(auth_settings)
+    }
+}
+
+// Query to get deployment with its project for access control
+pub struct GetDeploymentWithProjectQuery {
+    deployment_id: i64,
+}
+
+impl GetDeploymentWithProjectQuery {
+    pub fn new(deployment_id: i64) -> Self {
+        Self { deployment_id }
+    }
+
+    pub async fn execute_with_db<'e, E>(
+        &self,
+        executor: E,
+    ) -> Result<Option<DeploymentWithProject>, AppError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        let row = sqlx::query!(
+            r#"
+            SELECT
+                d.id as deployment_id,
+                d.project_id,
+                p.owner_id as project_owner_id
+            FROM deployments d
+            INNER JOIN projects p ON d.project_id = p.id
+            WHERE d.id = $1 AND d.deleted_at IS NULL
+            "#,
+            self.deployment_id
+        )
+        .fetch_optional(executor)
+        .await?;
+
+        Ok(row.map(|r| DeploymentWithProject {
+            deployment_id: r.deployment_id,
+            project_id: r.project_id,
+            project_owner_id: r.project_owner_id,
+        }))
+    }
+}
+
+pub struct DeploymentWithProject {
+    pub deployment_id: i64,
+    pub project_id: i64,
+    pub project_owner_id: Option<String>,
+}
+
+pub struct GetDeploymentChargebeeSubscriptionIdQuery {
+    pub deployment_id: i64,
+}
+
+impl GetDeploymentChargebeeSubscriptionIdQuery {
+    pub fn new(deployment_id: i64) -> Self {
+        Self { deployment_id }
+    }
+
+    pub async fn execute_with_db<'e, E>(&self, executor: E) -> Result<Option<String>, AppError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        let row = sqlx::query!(
+            r#"
+            SELECT s.provider_subscription_id
+            FROM deployments d
+            JOIN projects p ON d.project_id = p.id
+            JOIN billing_accounts ba ON p.billing_account_id = ba.id
+            LEFT JOIN subscriptions s ON ba.id = s.billing_account_id
+            WHERE d.id = $1
+            "#,
+            self.deployment_id
+        )
+        .fetch_optional(executor)
+        .await?;
+
+        Ok(row.and_then(|r| Some(r.provider_subscription_id)))
+    }
+}
+
+pub struct GetDeploymentModeQuery {
+    pub deployment_id: i64,
+}
+
+impl GetDeploymentModeQuery {
+    pub fn new(deployment_id: i64) -> Self {
+        Self { deployment_id }
+    }
+
+    pub async fn execute_with_db<'e, E>(self, executor: E) -> Result<Option<String>, AppError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        let row = sqlx::query!(
+            r#"SELECT mode FROM deployments WHERE id = $1 AND deleted_at IS NULL"#,
+            self.deployment_id,
+        )
+        .fetch_optional(executor)
+        .await?;
+        Ok(row.map(|r| r.mode))
+    }
+}
+
+pub struct GetDeploymentImageUrlQuery {
+    pub deployment_id: i64,
+    pub image_type: String,
+}
+
+impl GetDeploymentImageUrlQuery {
+    pub fn new(deployment_id: i64, image_type: impl Into<String>) -> Self {
+        Self {
+            deployment_id,
+            image_type: image_type.into(),
+        }
+    }
+
+    /// Current stored CDN URL for the given deployment image slot, or None.
+    pub async fn execute_with_db<'e, E>(&self, executor: E) -> Result<Option<String>, AppError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        let column = match self.image_type.as_str() {
+            "logo" => "logo_image_url",
+            "favicon" => "favicon_image_url",
+            "user-profile" => "default_user_profile_image_url",
+            "org-profile" => "default_organization_profile_image_url",
+            "workspace-profile" => "default_workspace_profile_image_url",
+            _ => return Ok(None),
+        };
+        // `column` is from the fixed whitelist above — not user input.
+        let sql = format!("SELECT {column} FROM deployment_ui_settings WHERE deployment_id = $1");
+        let row: Option<(Option<String>,)> = sqlx::query_as(&sql)
+            .bind(self.deployment_id)
+            .fetch_optional(executor)
+            .await?;
+        Ok(row.and_then(|(url,)| url).filter(|u| !u.trim().is_empty()))
+    }
+}

@@ -1,0 +1,90 @@
+# syntax=docker/dockerfile:1
+
+FROM rust:1.93-bookworm AS chef
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libprotobuf-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-chef --locked
+WORKDIR /app
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY models/Cargo.toml models/Cargo.toml
+COPY dto/Cargo.toml dto/Cargo.toml
+COPY commands/Cargo.toml commands/Cargo.toml
+COPY queries/Cargo.toml queries/Cargo.toml
+COPY common/Cargo.toml common/Cargo.toml
+COPY platform/Cargo.toml platform/Cargo.toml
+COPY worker/Cargo.toml worker/Cargo.toml
+COPY agent-engine/Cargo.toml agent-engine/Cargo.toml
+COPY oauth-relay/Cargo.toml oauth-relay/Cargo.toml
+COPY templatekit/Cargo.toml templatekit/Cargo.toml
+
+# Ensure cargo metadata sees at least one target per workspace member.
+COPY models/src/lib.rs models/src/lib.rs
+COPY dto/src/lib.rs dto/src/lib.rs
+COPY commands/src/lib.rs commands/src/lib.rs
+COPY queries/src/lib.rs queries/src/lib.rs
+COPY common/src/lib.rs common/src/lib.rs
+COPY platform/src/lib.rs platform/src/lib.rs
+COPY platform/src/bin/backend-api.rs platform/src/bin/backend-api.rs
+COPY platform/src/bin/console-api.rs platform/src/bin/console-api.rs
+COPY platform/src/bin/machine-api.rs platform/src/bin/machine-api.rs
+COPY platform/src/bin/oauth-api.rs platform/src/bin/oauth-api.rs
+COPY platform/src/bin/gateway-api.rs platform/src/bin/gateway-api.rs
+COPY worker/src/main.rs worker/src/main.rs
+COPY agent-engine/src/lib.rs agent-engine/src/lib.rs
+COPY oauth-relay/src/lib.rs oauth-relay/src/lib.rs
+COPY templatekit/src/lib.rs templatekit/src/lib.rs
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+WORKDIR /app
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json
+
+# Temporary cache bypass: pass a fresh value to force a clean source rebuild
+# (deps above stay cached): docker build --build-arg CACHEBUST=$(date +%s) …
+ARG CACHEBUST=0
+RUN echo "cachebust=${CACHEBUST}"
+
+COPY Cargo.toml Cargo.lock ./
+COPY .sqlx/ ./.sqlx/
+COPY models/ ./models/
+COPY dto/ ./dto/
+COPY commands/ ./commands/
+COPY queries/ ./queries/
+COPY common/ ./common/
+COPY platform/ ./platform/
+COPY worker/ ./worker/
+COPY agent-engine/ ./agent-engine/
+COPY oauth-relay/ ./oauth-relay/
+COPY templatekit/ ./templatekit/
+
+# Build only the binaries this image serves.
+RUN cargo build --release --locked \
+    -p platform --bin backend-api --bin console-api --bin machine-api --bin oauth-api --bin gateway-api \
+    -p platform-worker --bin worker
+
+FROM debian:bookworm-slim
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    curl \
+    gnupg \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+RUN (curl -Ls --tlsv1.2 --proto "=https" --retry 3 https://cli.doppler.com/install.sh || wget -t 3 -qO- https://cli.doppler.com/install.sh) | sh
+
+COPY --from=builder /app/target/release/backend-api /app/backend
+COPY --from=builder /app/target/release/console-api /app/console
+COPY --from=builder /app/target/release/machine-api /app/machine
+COPY --from=builder /app/target/release/oauth-api /app/oauth-api
+COPY --from=builder /app/target/release/gateway-api /app/gateway
+COPY --from=builder /app/target/release/worker /app/worker
+
+EXPOSE 3001
+ENTRYPOINT ["doppler", "run", "--"]

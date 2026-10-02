@@ -1,0 +1,1865 @@
+import { useEffect, useMemo, useState } from "react";
+import { useNavigate, useParams } from "react-router";
+import { useTour } from "@/lib/tour";
+import { format } from "date-fns";
+import { Pencil, Plus, RotateCw, Check, Copy, ChevronRight } from "lucide-react";
+import { toast } from "sonner";
+import { InlineLoader } from "@/components/ui/loading-screen";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { Pill } from "@/components/ui/pill";
+import { Tag } from "@/components/ui/tag";
+import { SectionLabel } from "@/components/ui/section-label";
+import { TableEmptyRow } from "@/components/ui/table-empty-row";
+import { Textarea } from "@/components/ui/textarea";
+import { SkeletonTableRows } from "@/components/ui/app-skeleton";
+import {
+    Dialog,
+    DialogContent,
+    DialogFooter,
+    DialogHeader,
+    DialogTitle,
+} from "@/components/ui/dialog";
+import {
+    Select,
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
+} from "@/components/ui/select";
+import {
+    Table,
+    TableBody,
+    TableCell,
+    TableHead,
+    TableHeader,
+    TableRow,
+} from "@/components/ui/app-table";
+import { Switch } from "@/components/ui/switch"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+    useArchiveOAuthScope,
+    useCreateOAuthClient,
+    useSetOAuthScopeMapping,
+    useUnarchiveOAuthScope,
+    useOAuthApps,
+    useOAuthAppSigningKeys,
+    useOAuthClients,
+    useRotateOAuthAppSigningKey,
+    useCompromiseOAuthAppSigningKey,
+    useUpdateOAuthApp,
+    useUpdateOAuthScope,
+    useVerifyOAuthAppDomain,
+    type OAuthAppSigningKey,
+} from "@/lib/api/hooks/use-oauth-management";
+import { useCurrentDeployemnt } from "@/lib/api/hooks/use-deployment-settings";
+import { useProjects } from "@/lib/api/hooks/use-projects";
+import type {
+    JwksDocument,
+    OAuthClient,
+    OAuthScopeDefinition,
+} from "@/types/oauth-management";
+
+function splitCsv(value: string): string[] {
+    return value
+        .split(",")
+        .map((v) => v.trim())
+        .filter(Boolean);
+}
+
+function formatClientAuthMethodLabel(method: string): string {
+    const labels: Record<string, string> = {
+        client_secret_basic: "Client Secret Basic",
+        client_secret_post: "Client Secret Post",
+        client_secret_jwt: "Client Secret JWT",
+        private_key_jwt: "Private Key JWT",
+        none: "No Client Authentication",
+    };
+    return labels[method] ?? method;
+}
+
+function formatGrantTypeLabel(grantType: string): string {
+    const labels: Record<string, string> = {
+        authorization_code: "Authorization Code",
+        refresh_token: "Refresh Token",
+        client_credentials: "Client Credentials",
+    };
+    return labels[grantType] ?? grantType;
+}
+
+function defaultScopeDisplayName(scope: string): string {
+    return scope
+        .split(/[_:.-]/g)
+        .filter(Boolean)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(" ");
+}
+
+function defaultScopeDescription(scope: string): string {
+    return `Access for ${scope}.`;
+}
+
+function normalizeScopeDefinitions(
+    scopes: string[],
+    definitions: OAuthScopeDefinition[],
+): OAuthScopeDefinition[] {
+    const byScope = new Map(
+        definitions.map((definition) => [definition.scope, definition]),
+    );
+
+    return scopes.map((scope) => {
+        const existing = byScope.get(scope);
+
+        return {
+            scope,
+            display_name:
+                existing?.display_name?.trim() ||
+                defaultScopeDisplayName(scope),
+            description:
+                existing?.description?.trim() || defaultScopeDescription(scope),
+            archived: !!existing?.archived,
+            category: existing?.category || "",
+            organization_permission:
+                existing?.organization_permission || undefined,
+            workspace_permission: existing?.workspace_permission || undefined,
+        };
+    });
+}
+
+function PillInput({
+    values,
+    onChange,
+    placeholder,
+    onEdit,
+    getMeta,
+}: {
+    values: string[];
+    onChange: (values: string[]) => void;
+    placeholder: string;
+    onEdit?: (value: string) => void;
+    getMeta?: (value: string) => { archived?: boolean };
+}) {
+    const [draft, setDraft] = useState("");
+
+    const commit = (raw: string) => {
+        const incoming = splitCsv(raw);
+        if (incoming.length === 0) return;
+        const merged = [...values];
+        for (const value of incoming) {
+            if (!merged.includes(value)) merged.push(value);
+        }
+        onChange(merged);
+    };
+
+    return (
+        <div className="space-y-2">
+            {values.length > 0 ? (
+                <div className="flex flex-wrap gap-2">
+                    {values.map((value) => (
+                        <span
+                            key={value}
+                            className="inline-flex h-7 items-center gap-1.5 rounded-md bg-primary/10 pl-2.5 pr-1.5 font-mono text-[11px] font-medium text-primary"
+                        >
+                            {value}
+                            {getMeta?.(value)?.archived ? (
+                                <span className="text-[10px] text-primary/60">
+                                    archived
+                                </span>
+                            ) : null}
+                            {onEdit ? (
+                                <button
+                                    type="button"
+                                    className="flex h-4 w-4 items-center justify-center rounded text-primary/60 hover:bg-primary/10 hover:text-primary"
+                                    onClick={() => onEdit(value)}
+                                    title="Edit scope details"
+                                >
+                                    <Pencil className="h-3 w-3" />
+                                </button>
+                            ) : null}
+                        </span>
+                    ))}
+                </div>
+            ) : null}
+            <Input
+                placeholder={placeholder}
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === ",") {
+                        e.preventDefault();
+                        commit(draft);
+                        setDraft("");
+                    }
+                }}
+                onBlur={() => {
+                    commit(draft);
+                    setDraft("");
+                }}
+            />
+        </div>
+    );
+}
+
+function CreateOAuthClientDialog({
+    open,
+    onClose,
+    oauthAppSlug,
+    onCreated,
+}: {
+    open: boolean;
+    onClose: () => void;
+    oauthAppSlug: string;
+    onCreated: (client: OAuthClient) => void;
+}) {
+    const createOAuthClient = useCreateOAuthClient(oauthAppSlug);
+    const [clientAuthMethod, setClientAuthMethod] = useState(
+        "client_secret_basic",
+    );
+    const [allowRefreshToken, setAllowRefreshToken] = useState(true);
+    const [redirectUris, setRedirectUris] = useState("");
+    const [tokenSigningAlg, setTokenSigningAlg] = useState("");
+    const [keyMaterialMode, setKeyMaterialMode] = useState<
+        "jwks_uri" | "jwks" | "pem"
+    >("jwks_uri");
+    const [jwksUri, setJwksUri] = useState("");
+    const [jwksJson, setJwksJson] = useState("");
+    const [publicKeyPem, setPublicKeyPem] = useState("");
+
+    const handleClose = () => {
+        setClientAuthMethod("client_secret_basic");
+        setAllowRefreshToken(true);
+        setRedirectUris("");
+        setTokenSigningAlg("");
+        setKeyMaterialMode("jwks_uri");
+        setJwksUri("");
+        setJwksJson("");
+        setPublicKeyPem("");
+        onClose();
+    };
+
+    const handleCreate = async () => {
+        const request: {
+            client_auth_method: string;
+            grant_types: string[];
+            redirect_uris: string[];
+            token_endpoint_auth_signing_alg?: string;
+            jwks_uri?: string;
+            jwks?: JwksDocument;
+            public_key_pem?: string;
+        } = {
+            client_auth_method: clientAuthMethod,
+            grant_types: allowRefreshToken
+                ? ["authorization_code", "refresh_token"]
+                : ["authorization_code"],
+            redirect_uris: splitCsv(redirectUris),
+        };
+
+        const signingAlg = tokenSigningAlg.trim();
+        if (signingAlg) {
+            request.token_endpoint_auth_signing_alg = signingAlg;
+        }
+
+        if (clientAuthMethod === "private_key_jwt") {
+            if (keyMaterialMode === "jwks_uri") {
+                const trimmedJwksUri = jwksUri.trim();
+                if (!trimmedJwksUri) {
+                    toast.error("JWKS URI is required for private_key_jwt");
+                    return;
+                }
+                request.jwks_uri = trimmedJwksUri;
+            } else if (keyMaterialMode === "jwks") {
+                const trimmedJwksJson = jwksJson.trim();
+                if (!trimmedJwksJson) {
+                    toast.error("JWKS JSON is required for private_key_jwt");
+                    return;
+                }
+                try {
+                    const parsed = JSON.parse(trimmedJwksJson) as JwksDocument;
+                    if (
+                        !Array.isArray(parsed.keys) ||
+                        parsed.keys.length === 0
+                    ) {
+                        toast.error(
+                            "JWKS JSON must include a non-empty keys array",
+                        );
+                        return;
+                    }
+                    request.jwks = parsed;
+                } catch {
+                    toast.error("JWKS JSON is invalid");
+                    return;
+                }
+            } else {
+                const trimmedPem = publicKeyPem.trim();
+                if (!trimmedPem) {
+                    toast.error(
+                        "Public key PEM is required for private_key_jwt",
+                    );
+                    return;
+                }
+                request.public_key_pem = trimmedPem;
+            }
+        }
+
+        const created = await createOAuthClient.mutateAsync(request);
+
+        onCreated(created);
+        handleClose();
+    };
+
+    return (
+        <Dialog open={open} onOpenChange={(val) => !val && handleClose()}>
+            <DialogContent className="sm:max-w-lg">
+                <DialogHeader>
+                    <DialogTitle>Create OAuth Client</DialogTitle>
+                </DialogHeader>
+                <div className="space-y-3 py-2">
+                    <div>
+                        <p className="mb-2 text-sm text-muted-foreground">
+                            Client Authentication Method
+                        </p>
+                        <Select
+                            value={clientAuthMethod}
+                            onValueChange={setClientAuthMethod}
+                        >
+                            <SelectTrigger className="w-full">
+                                <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                                <SelectItem value="client_secret_basic">
+                                    Client Secret Basic
+                                </SelectItem>
+                                <SelectItem value="client_secret_post">
+                                    Client Secret Post
+                                </SelectItem>
+                                <SelectItem value="client_secret_jwt">
+                                    Client Secret JWT
+                                </SelectItem>
+                                <SelectItem value="none">
+                                    No Client Authentication
+                                </SelectItem>
+                                <SelectItem value="private_key_jwt">
+                                    Private Key JWT
+                                </SelectItem>
+                            </SelectContent>
+                        </Select>
+                    </div>
+                    <div>
+                        <p className="mb-2 text-sm text-muted-foreground">
+                            Grant Types
+                        </p>
+                        <div className="space-y-2 rounded-md border p-3">
+                            <div className="flex items-center justify-between gap-3">
+                                <div>
+                                    <p className="text-sm">
+                                        Authorization Code
+                                    </p>
+                                    <p className="text-xs text-muted-foreground">
+                                        Required
+                                    </p>
+                                </div>
+                                <Switch checked disabled />
+                            </div>
+                            <div className="flex items-center justify-between gap-3">
+                                <div>
+                                    <p className="text-sm">Refresh Token</p>
+                                    <p className="text-xs text-muted-foreground">
+                                        Optional
+                                    </p>
+                                </div>
+                                <Switch
+                                    checked={allowRefreshToken}
+                                    onCheckedChange={setAllowRefreshToken}
+                                />
+                            </div>
+                        </div>
+                    </div>
+                    <div>
+                        <p className="mb-2 text-sm text-muted-foreground">
+                            Redirect URIs
+                        </p>
+                        <Textarea
+                            placeholder="https://app.example.com/callback"
+                            value={redirectUris}
+                            onChange={(e) => setRedirectUris(e.target.value)}
+                            rows={2}
+                        />
+                    </div>
+
+                    {(clientAuthMethod === "client_secret_jwt" ||
+                        clientAuthMethod === "private_key_jwt") && (
+                        <div>
+                            <p className="mb-2 text-sm text-muted-foreground">
+                                Token Endpoint Signing Algorithm
+                            </p>
+                            <Input
+                                placeholder={
+                                    clientAuthMethod === "private_key_jwt"
+                                        ? "RS256"
+                                        : "HS256"
+                                }
+                                value={tokenSigningAlg}
+                                onChange={(e) =>
+                                    setTokenSigningAlg(e.target.value)
+                                }
+                            />
+                        </div>
+                    )}
+
+                    {clientAuthMethod === "private_key_jwt" && (
+                        <div className="space-y-3">
+                            <div>
+                                <p className="mb-2 text-sm text-muted-foreground">
+                                    Public Key Source
+                                </p>
+                                <Select
+                                    value={keyMaterialMode}
+                                    onValueChange={(value) =>
+                                        setKeyMaterialMode(
+                                            value as
+                                                | "jwks_uri"
+                                                | "jwks"
+                                                | "pem",
+                                        )
+                                    }
+                                >
+                                    <SelectTrigger className="w-full">
+                                        <SelectValue />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        <SelectItem value="jwks_uri">
+                                            JWKS URI
+                                        </SelectItem>
+                                        <SelectItem value="jwks">
+                                            Inline JWKS JSON
+                                        </SelectItem>
+                                        <SelectItem value="pem">
+                                            Public Key PEM
+                                        </SelectItem>
+                                    </SelectContent>
+                                </Select>
+                            </div>
+
+                            {keyMaterialMode === "jwks_uri" ? (
+                                <div>
+                                    <p className="mb-2 text-sm text-muted-foreground">
+                                        JWKS URI
+                                    </p>
+                                    <Input
+                                        placeholder="https://client.example.com/.well-known/jwks.json"
+                                        value={jwksUri}
+                                        onChange={(e) =>
+                                            setJwksUri(e.target.value)
+                                        }
+                                    />
+                                </div>
+                            ) : keyMaterialMode === "jwks" ? (
+                                <div>
+                                    <p className="mb-2 text-sm text-muted-foreground">
+                                        JWKS JSON
+                                    </p>
+                                    <Textarea
+                                        placeholder='{"keys":[{"kty":"RSA","kid":"my-key","n":"...","e":"AQAB"}]}'
+                                        value={jwksJson}
+                                        onChange={(e) =>
+                                            setJwksJson(e.target.value)
+                                        }
+                                        rows={5}
+                                    />
+                                </div>
+                            ) : (
+                                <div>
+                                    <p className="mb-2 text-sm text-muted-foreground">
+                                        Public Key PEM
+                                    </p>
+                                    <Textarea
+                                        placeholder={
+                                            "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+                                        }
+                                        value={publicKeyPem}
+                                        onChange={(e) =>
+                                            setPublicKeyPem(e.target.value)
+                                        }
+                                        rows={6}
+                                    />
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </div>
+                <DialogFooter>
+                    <Button variant="ghost" onClick={handleClose}>
+                        Cancel
+                    </Button>
+                    <Button
+                        onClick={handleCreate}
+                        disabled={createOAuthClient.isPending}
+                    >
+                        {createOAuthClient.isPending
+                            ? "Creating..."
+                            : "Create OAuth Client"}
+                    </Button>
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
+    );
+}
+
+function OAuthClientCreatedDialog({
+    client,
+    open,
+    onClose,
+}: {
+    client?: OAuthClient;
+    open: boolean;
+    onClose: () => void;
+}) {
+    if (!client) return null;
+    const clientSecret = client.client_secret;
+
+    const copy = async (value: string, label: string) => {
+        try {
+            await navigator.clipboard.writeText(value);
+            toast.success(`${label} copied`);
+        } catch {
+            toast.error(`Failed to copy ${label.toLowerCase()}`);
+        }
+    };
+
+    const downloadDetails = () => {
+        const payload = {
+            client_id: client.client_id,
+            client_secret: client.client_secret ?? null,
+            grant_types: client.grant_types,
+            redirect_uris: client.redirect_uris,
+            token_endpoint_auth_signing_alg:
+                client.token_endpoint_auth_signing_alg ?? null,
+            jwks_uri: client.jwks_uri ?? null,
+            jwks: client.jwks ?? null,
+            public_key_pem: client.public_key_pem ?? null,
+        };
+        const blob = new Blob([JSON.stringify(payload, null, 2)], {
+            type: "application/json",
+        });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = `${client.client_id}-credentials.json`;
+        document.body.appendChild(anchor);
+        anchor.click();
+        document.body.removeChild(anchor);
+        URL.revokeObjectURL(url);
+    };
+
+    const isSecretBased =
+        client.client_auth_method === "client_secret_basic" ||
+        client.client_auth_method === "client_secret_post" ||
+        client.client_auth_method === "client_secret_jwt";
+
+    return (
+        <Dialog open={open} onOpenChange={(val) => !val && onClose()}>
+            <DialogContent className="sm:max-w-lg">
+                <DialogHeader>
+                    <DialogTitle>OAuth Client Created</DialogTitle>
+                </DialogHeader>
+
+                <div className="space-y-4 py-1">
+                    <div className="space-y-2">
+                        <div className="rounded border px-3 py-2">
+                            <div className="flex items-center justify-between gap-2">
+                                <p className="text-xs text-muted-foreground">
+                                    Client ID
+                                </p>
+                                <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-6 px-2 text-xs"
+                                    onClick={() =>
+                                        copy(client.client_id, "Client ID")
+                                    }
+                                >
+                                    Copy
+                                </Button>
+                            </div>
+                            <p className="font-mono text-xs break-all">
+                                {client.client_id}
+                            </p>
+                        </div>
+                    </div>
+
+                    {isSecretBased && (
+                        <div className="space-y-2 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2">
+                            <div className="flex items-center justify-between gap-2">
+                                <p className="text-xs text-amber-700 dark:text-amber-300">
+                                    Client Secret (shown once)
+                                </p>
+                                {clientSecret ? (
+                                    <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="sm"
+                                        className="h-6 px-2 text-xs text-amber-700 hover:text-amber-700 dark:text-amber-300"
+                                        onClick={() =>
+                                            copy(clientSecret, "Client secret")
+                                        }
+                                    >
+                                        Copy
+                                    </Button>
+                                ) : null}
+                            </div>
+                            <p className="font-mono text-xs break-all text-amber-700 dark:text-amber-300">
+                                {clientSecret ?? "Secret was not returned"}
+                            </p>
+                        </div>
+                    )}
+
+                    {client.client_auth_method === "none" && (
+                        <p className="text-sm text-muted-foreground">
+                            This is a public client. Use only{" "}
+                            <code>client_id</code> in token/authorization
+                            requests.
+                        </p>
+                    )}
+
+                    {client.client_auth_method === "private_key_jwt" && (
+                        <div className="space-y-2">
+                            <p className="text-sm text-muted-foreground">
+                                This client authenticates using signed JWT
+                                assertions with its private key.
+                            </p>
+                            {client.jwks_uri && (
+                                <div className="rounded border px-3 py-2">
+                                    <p className="text-xs text-muted-foreground">
+                                        Registered JWKS URI
+                                    </p>
+                                    <p className="font-mono text-xs break-all">
+                                        {client.jwks_uri}
+                                    </p>
+                                </div>
+                            )}
+                            {client.jwks && (
+                                <div className="rounded border px-3 py-2">
+                                    <p className="text-xs text-muted-foreground">
+                                        Registered JWKS
+                                    </p>
+                                    <p className="text-xs text-muted-foreground">
+                                        {client.jwks.keys.length} key(s)
+                                    </p>
+                                </div>
+                            )}
+                            {client.public_key_pem && (
+                                <div className="rounded border px-3 py-2">
+                                    <p className="text-xs text-muted-foreground">
+                                        Registered Public Key (PEM)
+                                    </p>
+                                    <p className="text-xs text-muted-foreground">
+                                        Stored for later parsing/normalization.
+                                    </p>
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </div>
+
+                <DialogFooter>
+                    <Button
+                        type="button"
+                        variant="outline"
+                        onClick={downloadDetails}
+                    >
+                        Download Details
+                    </Button>
+                    <Button onClick={onClose}>Done</Button>
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
+    );
+}
+
+export default function OAuthAppDetailsPage() {
+    const navigate = useNavigate();
+    const { slug } = useParams();
+    const oauthAppSlug = slug || "";
+
+    const [activeTab, setActiveTab] = useState("clients");
+    const [isCreateClientOpen, setIsCreateClientOpen] = useState(false);
+    const [createdClient, setCreatedClient] = useState<OAuthClient>();
+    const [domainVerified, setDomainVerified] = useState<boolean | null>(null);
+    const [confirmRotateKey, setConfirmRotateKey] = useState(false);
+
+    const { data: oauthApps = [], isLoading: oauthAppsLoading } =
+        useOAuthApps();
+    useTour("first-oauth-app-details", !oauthAppsLoading);
+    const { deploymentSettings } = useCurrentDeployemnt();
+    const { selectedDeployment } = useProjects();
+    const verifyOAuthAppDomain = useVerifyOAuthAppDomain(oauthAppSlug);
+    const { data: oauthClients = [], isLoading: oauthClientsLoading } =
+        useOAuthClients(oauthAppSlug);
+    const { data: signingKeys = [], isLoading: signingKeysLoading } =
+        useOAuthAppSigningKeys(oauthAppSlug);
+    const rotateSigningKey = useRotateOAuthAppSigningKey(oauthAppSlug);
+    const updateOAuthApp = useUpdateOAuthApp(oauthAppSlug);
+
+    const handleRotateKeyConfirmed = async () => {
+        try {
+            await rotateSigningKey.mutateAsync();
+        } catch {
+            // toast surfaced in hook
+        } finally {
+            setConfirmRotateKey(false);
+        }
+    };
+
+    const oauthApp = useMemo(
+        () => oauthApps.find((app) => app.slug === oauthAppSlug),
+        [oauthApps, oauthAppSlug],
+    );
+    const [settingsName, setSettingsName] = useState("");
+    const [settingsDescription, setSettingsDescription] = useState("");
+    const [settingsScopes, setSettingsScopes] = useState<string[]>([]);
+    const [settingsScopeDefinitions, setSettingsScopeDefinitions] = useState<
+        OAuthScopeDefinition[]
+    >([]);
+    const [editingScope, setEditingScope] =
+        useState<OAuthScopeDefinition | null>(null);
+    const updateOAuthScope = useUpdateOAuthScope(
+        oauthAppSlug,
+        editingScope?.scope,
+    );
+    const archiveOAuthScope = useArchiveOAuthScope(
+        oauthAppSlug,
+        editingScope?.scope,
+    );
+    const unarchiveOAuthScope = useUnarchiveOAuthScope(
+        oauthAppSlug,
+        editingScope?.scope,
+    );
+    const setOAuthScopeMapping = useSetOAuthScopeMapping(
+        oauthAppSlug,
+        editingScope?.scope,
+    );
+    const [
+        settingsAllowDynamicRegistration,
+        setSettingsAllowDynamicRegistration,
+    ] = useState(false);
+    const [settingsActive, setSettingsActive] = useState(true);
+    const organizationPermissions =
+        deploymentSettings?.b2b_settings?.organization_permissions || [];
+    const workspacePermissions =
+        deploymentSettings?.b2b_settings?.workspace_permissions || [];
+
+    useEffect(() => {
+        if (!oauthApp) return;
+        setSettingsName(oauthApp.name);
+        setSettingsDescription(oauthApp.description || "");
+        const scopes = [...(oauthApp.supported_scopes || [])];
+        setSettingsScopes(scopes);
+        setSettingsScopeDefinitions(
+            normalizeScopeDefinitions(scopes, oauthApp.scope_definitions || []),
+        );
+        setSettingsAllowDynamicRegistration(
+            !!oauthApp.allow_dynamic_client_registration,
+        );
+        setSettingsActive(!!oauthApp.is_active);
+    }, [oauthApp]);
+
+    useEffect(() => {
+        setSettingsScopeDefinitions((previous) =>
+            normalizeScopeDefinitions(settingsScopes, previous),
+        );
+    }, [settingsScopes]);
+
+    if (oauthAppsLoading) return <InlineLoader />;
+
+    if (!oauthApp) {
+        return (
+            <div className="flex flex-col gap-3">
+                <p className="text-sm text-muted-foreground">
+                    OAuth app not found.
+                </p>
+            </div>
+        );
+    }
+
+    const handleSaveSettings = async () => {
+        await updateOAuthApp.mutateAsync({
+            name: settingsName.trim(),
+            description: settingsDescription.trim() || undefined,
+            supported_scopes: settingsScopes,
+            allow_dynamic_client_registration: settingsAllowDynamicRegistration,
+            is_active: settingsActive,
+        });
+    };
+
+    const updateScopeDefinition = (
+        scope: string,
+        update: Partial<OAuthScopeDefinition>,
+    ) => {
+        setSettingsScopeDefinitions((previous) =>
+            previous.map((definition) =>
+                definition.scope === scope
+                    ? { ...definition, ...update, scope: definition.scope }
+                    : definition,
+            ),
+        );
+    };
+
+    const openScopeEditor = (scope: string) => {
+        const definition = settingsScopeDefinitions.find(
+            (d) => d.scope === scope,
+        );
+        if (!definition) return;
+        setEditingScope({ ...definition });
+    };
+
+    const saveScopeEditor = async () => {
+        if (!editingScope) return;
+        const original = settingsScopeDefinitions.find(
+            (d) => d.scope === editingScope.scope,
+        );
+        if (!original) return;
+
+        await updateOAuthScope.mutateAsync({
+            display_name: editingScope.display_name,
+            description: editingScope.description,
+        });
+
+        const mappingChanged =
+            original.category !== editingScope.category ||
+            original.organization_permission !==
+                editingScope.organization_permission ||
+            original.workspace_permission !== editingScope.workspace_permission;
+        if (mappingChanged && editingScope.category) {
+            await setOAuthScopeMapping.mutateAsync({
+                category:
+                    editingScope.category as
+                        | "personal"
+                        | "organization"
+                        | "workspace",
+                organization_permission: editingScope.organization_permission,
+                workspace_permission: editingScope.workspace_permission,
+            });
+        }
+
+        if (original.archived !== editingScope.archived) {
+            if (editingScope.archived) {
+                await archiveOAuthScope.mutateAsync();
+            } else {
+                await unarchiveOAuthScope.mutateAsync();
+            }
+        }
+
+        updateScopeDefinition(editingScope.scope, {
+            display_name: editingScope.display_name,
+            description: editingScope.description,
+            archived: editingScope.archived,
+            category: editingScope.category,
+            organization_permission: editingScope.organization_permission,
+            workspace_permission: editingScope.workspace_permission,
+        });
+        setEditingScope(null);
+    };
+
+    const editingScopeOriginal = editingScope
+        ? settingsScopeDefinitions.find((d) => d.scope === editingScope.scope)
+        : null;
+    const isCategoryLocked = !!editingScopeOriginal?.category;
+    const isOrganizationPermissionLocked =
+        !!editingScopeOriginal?.organization_permission;
+    const isWorkspacePermissionLocked =
+        !!editingScopeOriginal?.workspace_permission;
+    const isScopeSavePending =
+        updateOAuthScope.isPending ||
+        setOAuthScopeMapping.isPending ||
+        archiveOAuthScope.isPending ||
+        unarchiveOAuthScope.isPending;
+
+    const copyRuntimeValue = async (label: string, value: string) => {
+        try {
+            await navigator.clipboard.writeText(value);
+            toast.success(`${label} copied`);
+        } catch {
+            toast.error(`Failed to copy ${label.toLowerCase()}`);
+        }
+    };
+
+    const issuerUrl = `https://${oauthApp.fqdn}`;
+    const authorizationEndpoint = `${issuerUrl}/oauth/authorize`;
+    const tokenEndpoint = `${issuerUrl}/oauth/token`;
+    const revocationEndpoint = `${issuerUrl}/oauth/revoke`;
+    const introspectionEndpoint = `${issuerUrl}/oauth/introspect`;
+    const registrationEndpoint = `${issuerUrl}/oauth/register`;
+    const userinfoEndpoint = `${issuerUrl}/oauth/userinfo`;
+    const endSessionEndpoint = `${issuerUrl}/oauth/logout`;
+    const metadataEndpoint = `${issuerUrl}/.well-known/oauth-authorization-server`;
+    const openidConfigurationEndpoint = `${issuerUrl}/.well-known/openid-configuration`;
+    const jwksEndpoint = `${issuerUrl}/.well-known/jwks.json`;
+    const connectorMapTarget = "oauth.wacht.services";
+    const runtimeEndpoints = [
+        { label: "Authorization", value: authorizationEndpoint, method: "GET" },
+        { label: "Token", value: tokenEndpoint, method: "POST" },
+        { label: "UserInfo", value: userinfoEndpoint, method: "GET" },
+        { label: "End Session", value: endSessionEndpoint, method: "GET" },
+        { label: "Revocation", value: revocationEndpoint, method: "POST" },
+        { label: "Introspection", value: introspectionEndpoint, method: "POST" },
+        { label: "Dynamic Registration", value: registrationEndpoint, method: "POST" },
+    ];
+    const discoveryEndpoints = [
+        { label: "OpenID Configuration", value: openidConfigurationEndpoint, method: "GET" },
+        { label: "JWKS", value: jwksEndpoint, method: "GET" },
+        { label: "OAuth Metadata", value: metadataEndpoint, method: "GET" },
+    ];
+    const isProductionDeployment = selectedDeployment?.mode === "production";
+
+    const handleCheckDomain = async () => {
+        try {
+            const result = await verifyOAuthAppDomain.mutateAsync();
+            setDomainVerified(result.verified);
+            if (result.verified) {
+                toast.success("Domain verified");
+            } else {
+                toast.error(
+                    "Domain not verified yet. Ensure your CNAME points to oauth.wacht.services.",
+                );
+            }
+        } catch (error) {
+            const message =
+                error instanceof Error
+                    ? error.message
+                    : "Failed to check domain";
+            toast.error(message);
+        }
+    };
+
+    return (
+        <>
+            <div className="space-y-6">
+                <section>
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                        <div className="flex items-start gap-4">
+                            <Avatar className="h-14 w-14 overflow-hidden rounded-xl after:rounded-xl">
+                                <AvatarImage
+                                    src={oauthApp.logo_url}
+                                    className="rounded-xl"
+                                />
+                                <AvatarFallback className="rounded-xl bg-primary/10 text-primary">
+                                    {oauthApp.name.slice(0, 1).toUpperCase()}
+                                </AvatarFallback>
+                            </Avatar>
+                            <div className="min-w-0">
+                                <h1 className="text-xl font-medium tracking-tight text-foreground">
+                                    {oauthApp.name}
+                                </h1>
+                                <div className="mt-2 flex flex-wrap items-center gap-2.5">
+                                    <Pill tone={oauthApp.is_active ? "ok" : "mute"}>
+                                        {oauthApp.is_active ? "active" : "inactive"}
+                                    </Pill>
+                                    <span className="font-mono text-[11px] text-muted-foreground">
+                                        {oauthClients.length} client
+                                        {oauthClients.length === 1 ? "" : "s"} ·{" "}
+                                        {signingKeys.length} signing key
+                                        {signingKeys.length === 1 ? "" : "s"}
+                                        {oauthApp.created_at
+                                            ? ` · created ${format(new Date(oauthApp.created_at), "MMM d, yyyy")}`
+                                            : ""}
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+                        <div className="flex shrink-0 flex-wrap items-center gap-2">
+                            {activeTab === "clients" ? (
+                                <Button onClick={() => setIsCreateClientOpen(true)}>
+                                    <Plus className="h-4 w-4" />
+                                    Create OAuth client
+                                </Button>
+                            ) : null}
+                            {activeTab === "runtime" ? (
+                                <>
+                                    <Button
+                                        variant="outline"
+                                        onClick={() =>
+                                            copyRuntimeValue(
+                                                "OAuth Domain",
+                                                oauthApp.fqdn,
+                                            )
+                                        }
+                                    >
+                                        <Copy className="h-4 w-4" />
+                                        Copy domain
+                                    </Button>
+                                    <Button
+                                        variant="outline"
+                                        onClick={() =>
+                                            copyRuntimeValue("Issuer URL", issuerUrl)
+                                        }
+                                    >
+                                        <Copy className="h-4 w-4" />
+                                        Copy issuer
+                                    </Button>
+                                </>
+                            ) : null}
+                            {activeTab === "signing-keys" ? (
+                                <Button
+                                    onClick={() => setConfirmRotateKey(true)}
+                                    disabled={rotateSigningKey.isPending}
+                                >
+                                    <RotateCw className="h-4 w-4" />
+                                    {rotateSigningKey.isPending
+                                        ? "Rotating…"
+                                        : "Rotate key"}
+                                </Button>
+                            ) : null}
+                            {activeTab === "settings" ? (
+                                <Button
+                                    onClick={handleSaveSettings}
+                                    disabled={updateOAuthApp.isPending}
+                                >
+                                    <Check className="h-4 w-4" />
+                                    {updateOAuthApp.isPending
+                                        ? "Saving…"
+                                        : "Save settings"}
+                                </Button>
+                            ) : null}
+                        </div>
+                    </div>
+                </section>
+
+                <Tabs value={activeTab} onValueChange={setActiveTab}>
+                    <TabsList variant="pill">
+                        <TabsTrigger
+                            value="clients"
+                            data-tour-id="oauth-app-tab-clients"
+                        >
+                            Clients
+                        </TabsTrigger>
+                        <TabsTrigger
+                            value="runtime"
+                            data-tour-id="oauth-app-tab-runtime"
+                        >
+                            Runtime
+                        </TabsTrigger>
+                        <TabsTrigger
+                            value="signing-keys"
+                            data-tour-id="oauth-app-tab-signing-keys"
+                        >
+                            Signing keys
+                        </TabsTrigger>
+                        <TabsTrigger
+                            value="settings"
+                            data-tour-id="oauth-app-tab-settings"
+                        >
+                            App settings
+                        </TabsTrigger>
+                    </TabsList>
+
+                    <TabsContent value="clients" className="mt-4">
+                        <div className="mb-3 flex items-baseline justify-between gap-3">
+                            <h2 className="text-base font-medium text-foreground">
+                                OAuth clients
+                            </h2>
+                            <span className="font-mono text-[11px] text-muted-foreground">
+                                {oauthClients.length} total
+                            </span>
+                        </div>
+
+                        <Table>
+                            <TableHeader>
+                                <TableRow>
+                                    <TableHead>Client ID</TableHead>
+                                    <TableHead>Auth method</TableHead>
+                                    <TableHead>Grant types</TableHead>
+                                    <TableHead>Created</TableHead>
+                                    <TableHead className="w-10" />
+                                </TableRow>
+                            </TableHeader>
+                            <TableBody>
+                                {oauthClientsLoading ? (
+                                    <SkeletonTableRows
+                                        rows={6}
+                                        columns={5}
+                                        withAvatar={false}
+                                    />
+                                ) : oauthClients.length === 0 ? (
+                                    <TableEmptyRow
+                                        colSpan={5}
+                                        title="No OAuth clients yet"
+                                        description="Create a client to issue tokens against this app."
+                                        action={
+                                            <Button
+                                                size="sm"
+                                                onClick={() =>
+                                                    setIsCreateClientOpen(true)
+                                                }
+                                            >
+                                                <Plus className="h-4 w-4" />
+                                                Create OAuth client
+                                            </Button>
+                                        }
+                                    />
+                                ) : (
+                                    oauthClients.map((client) => (
+                                        <TableRow
+                                            key={client.id}
+                                            className="cursor-pointer"
+                                            onClick={() =>
+                                                navigate(`clients/${client.id}`)
+                                            }
+                                        >
+                                            <TableCell className="font-mono text-xs text-foreground">
+                                                {client.client_id}
+                                            </TableCell>
+                                            <TableCell>
+                                                <Pill tone="info">
+                                                    {formatClientAuthMethodLabel(
+                                                        client.client_auth_method,
+                                                    )}
+                                                </Pill>
+                                            </TableCell>
+                                            <TableCell>
+                                                <div className="flex flex-wrap gap-1.5">
+                                                    {client.grant_types.map(
+                                                        (grant) => (
+                                                            <Tag key={grant}>
+                                                                {formatGrantTypeLabel(
+                                                                    grant,
+                                                                )}
+                                                            </Tag>
+                                                        ),
+                                                    )}
+                                                </div>
+                                            </TableCell>
+                                            <TableCell className="font-mono text-xs text-muted-foreground">
+                                                {format(
+                                                    new Date(client.created_at),
+                                                    "MMM d, yyyy",
+                                                )}
+                                            </TableCell>
+                                            <TableCell className="text-right">
+                                                <ChevronRight className="h-4 w-4 text-muted-foreground/50" />
+                                            </TableCell>
+                                        </TableRow>
+                                    ))
+                                )}
+                            </TableBody>
+                        </Table>
+                    </TabsContent>
+
+                    <TabsContent value="runtime" className="mt-4">
+                        <div className="space-y-7">
+                            <section className="space-y-3">
+                                <SectionLabel>Runtime profile</SectionLabel>
+                                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                                    {[
+                                        {
+                                            label: "Runtime domain (FQDN)",
+                                            value: oauthApp.fqdn,
+                                        },
+                                        { label: "Issuer", value: issuerUrl },
+                                    ].map((block) => (
+                                        <div
+                                            key={block.label}
+                                            className="rounded-lg border border-border bg-card p-4"
+                                        >
+                                            <p className="font-mono text-[10px] font-medium uppercase tracking-[0.06em] text-muted-foreground">
+                                                {block.label}
+                                            </p>
+                                            <div className="mt-2 flex items-center gap-2">
+                                                <code className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">
+                                                    {block.value}
+                                                </code>
+                                                <Button
+                                                    type="button"
+                                                    variant="ghost"
+                                                    size="sm"
+                                                    className="h-7 w-7 shrink-0 p-0 text-muted-foreground hover:text-foreground"
+                                                    onClick={() =>
+                                                        copyRuntimeValue(
+                                                            block.label,
+                                                            block.value,
+                                                        )
+                                                    }
+                                                >
+                                                    <Copy className="h-3.5 w-3.5" />
+                                                </Button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </section>
+
+                            {isProductionDeployment ? (
+                                <section className="space-y-3">
+                                    <SectionLabel
+                                        action={
+                                            <Button
+                                                type="button"
+                                                variant="outline"
+                                                size="sm"
+                                                className="ml-3"
+                                                onClick={handleCheckDomain}
+                                                disabled={
+                                                    verifyOAuthAppDomain.isPending
+                                                }
+                                            >
+                                                {verifyOAuthAppDomain.isPending
+                                                    ? "Checking…"
+                                                    : "Check domain"}
+                                            </Button>
+                                        }
+                                    >
+                                        Domain verification
+                                    </SectionLabel>
+                                    <div className="rounded-lg border border-border bg-card p-4">
+                                        <div className="flex items-center justify-between gap-3">
+                                            <p className="font-mono text-[10px] font-medium uppercase tracking-[0.06em] text-muted-foreground">
+                                                Map connector domain to
+                                            </p>
+                                            <Button
+                                                type="button"
+                                                variant="ghost"
+                                                size="sm"
+                                                className="h-7 px-2.5 text-[11px] text-muted-foreground hover:text-foreground"
+                                                onClick={() =>
+                                                    copyRuntimeValue(
+                                                        "Connector Map Target",
+                                                        connectorMapTarget,
+                                                    )
+                                                }
+                                            >
+                                                <Copy className="h-3 w-3" />
+                                                Copy
+                                            </Button>
+                                        </div>
+                                        <code className="mt-2 block break-all font-mono text-xs text-foreground">
+                                            {connectorMapTarget}
+                                        </code>
+                                        {domainVerified !== null ? (
+                                            <p
+                                                className={`mt-3 text-xs ${domainVerified ? "text-emerald-700 dark:text-emerald-300" : "text-amber-700 dark:text-amber-300"}`}
+                                            >
+                                                {domainVerified
+                                                    ? "Domain is verified."
+                                                    : "Domain is not verified yet. Point your CNAME to the target above."}
+                                            </p>
+                                        ) : null}
+                                    </div>
+                                </section>
+                            ) : null}
+
+                            {[
+                                {
+                                    title: "OAuth & OIDC",
+                                    rows: runtimeEndpoints,
+                                },
+                                { title: "Discovery", rows: discoveryEndpoints },
+                            ].map((group) => (
+                                <section key={group.title} className="space-y-3">
+                                    <SectionLabel>{group.title}</SectionLabel>
+                                    <div className="overflow-hidden rounded-lg border border-border bg-card">
+                                        {group.rows.map((item) => (
+                                            <div
+                                                key={item.label}
+                                                className="grid grid-cols-[1fr_auto] items-center gap-x-3 gap-y-1.5 border-b border-border px-4 py-3 last:border-0 sm:grid-cols-[170px_64px_1fr_auto] sm:gap-y-0"
+                                            >
+                                                <span className="font-mono text-[11px] font-medium uppercase tracking-[0.06em] text-muted-foreground">
+                                                    {item.label}
+                                                </span>
+                                                <Tag className="order-last sm:order-none">
+                                                    {item.method}
+                                                </Tag>
+                                                <code className="col-span-2 min-w-0 truncate font-mono text-xs text-secondary-foreground sm:col-span-1">
+                                                    {item.value}
+                                                </code>
+                                                <Button
+                                                    type="button"
+                                                    variant="outline"
+                                                    size="sm"
+                                                    className="hidden h-7 px-2.5 text-[11px] sm:inline-flex"
+                                                    onClick={() =>
+                                                        copyRuntimeValue(
+                                                            item.label,
+                                                            item.value,
+                                                        )
+                                                    }
+                                                >
+                                                    <Copy className="h-3 w-3" />
+                                                    Copy
+                                                </Button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </section>
+                            ))}
+                        </div>
+                    </TabsContent>
+
+                    <TabsContent value="signing-keys" className="mt-4">
+                        <SigningKeysSection
+                            oauthAppSlug={oauthAppSlug}
+                            keys={signingKeys}
+                            isLoading={signingKeysLoading}
+                        />
+                    </TabsContent>
+
+                    <TabsContent value="settings" className="mt-4">
+                        <h2 className="mb-3 text-base font-medium text-foreground">
+                            OAuth app settings
+                        </h2>
+                        <div className="overflow-hidden rounded-lg border border-border bg-card">
+                            <div className="space-y-5 p-6">
+                                <div>
+                                    <label className="mb-1.5 block text-sm font-medium text-foreground">
+                                        App name
+                                    </label>
+                                    <Input
+                                        value={settingsName}
+                                        onChange={(e) =>
+                                            setSettingsName(e.target.value)
+                                        }
+                                    />
+                                </div>
+
+                                <div>
+                                    <label className="mb-1.5 block text-sm font-medium text-foreground">
+                                        Description
+                                    </label>
+                                    <Textarea
+                                        value={settingsDescription}
+                                        onChange={(e) =>
+                                            setSettingsDescription(
+                                                e.target.value,
+                                            )
+                                        }
+                                        rows={3}
+                                    />
+                                </div>
+
+                                <div>
+                                    <label className="mb-1.5 block text-sm font-medium text-foreground">
+                                        Supported scopes
+                                    </label>
+                                    <PillInput
+                                        values={settingsScopes}
+                                        onChange={setSettingsScopes}
+                                        placeholder="Type scope and press Enter"
+                                        onEdit={openScopeEditor}
+                                        getMeta={(scope) => {
+                                            const definition =
+                                                settingsScopeDefinitions.find(
+                                                    (d) => d.scope === scope,
+                                                );
+                                            return {
+                                                archived:
+                                                    !!definition?.archived,
+                                            };
+                                        }}
+                                    />
+                                    <p className="mt-1.5 text-xs text-muted-foreground">
+                                        Scopes are append-only. Added scopes
+                                        cannot be removed.
+                                    </p>
+                                </div>
+                            </div>
+
+                            <div className="divide-y divide-border border-t border-border">
+                                <div className="flex items-start justify-between gap-4 px-6 py-4">
+                                    <div className="min-w-0">
+                                        <p className="text-sm font-medium text-foreground">
+                                            Allow dynamic client registration
+                                        </p>
+                                        <p className="mt-0.5 text-xs text-muted-foreground">
+                                            Allow clients to self-register via
+                                            OAuth registration APIs.
+                                        </p>
+                                    </div>
+                                    <Switch
+                                        checked={
+                                            settingsAllowDynamicRegistration
+                                        }
+                                        onCheckedChange={
+                                            setSettingsAllowDynamicRegistration
+                                        }
+                                    />
+                                </div>
+
+                                <div className="flex items-start justify-between gap-4 px-6 py-4">
+                                    <div className="min-w-0">
+                                        <p className="text-sm font-medium text-foreground">
+                                            App active
+                                        </p>
+                                        <p className="mt-0.5 text-xs text-muted-foreground">
+                                            Disable to block app usage.
+                                        </p>
+                                    </div>
+                                    <Switch
+                                        checked={settingsActive}
+                                        onCheckedChange={setSettingsActive}
+                                    />
+                                </div>
+                            </div>
+                        </div>
+                    </TabsContent>
+                </Tabs>
+            </div>
+
+            <CreateOAuthClientDialog
+                open={isCreateClientOpen}
+                onClose={() => setIsCreateClientOpen(false)}
+                oauthAppSlug={oauthAppSlug}
+                onCreated={(client) => {
+                    setCreatedClient(client);
+                }}
+            />
+
+            <OAuthClientCreatedDialog
+                client={createdClient}
+                open={!!createdClient}
+                onClose={() => setCreatedClient(undefined)}
+            />
+
+            <Dialog
+                open={confirmRotateKey}
+                onOpenChange={(open) => {
+                    if (!open && !rotateSigningKey.isPending)
+                        setConfirmRotateKey(false);
+                }}
+            >
+                <DialogContent className="sm:max-w-md">
+                    <DialogHeader>
+                        <DialogTitle>Rotate signing key?</DialogTitle>
+                    </DialogHeader>
+                    <div className="space-y-3 text-sm text-muted-foreground">
+                        <p>
+                            The current active key is marked{" "}
+                            <code className="rounded bg-secondary px-1 py-0.5 font-mono text-xs text-foreground">
+                                retired
+                            </code>{" "}
+                            (still published in JWKS so in-flight id_tokens keep
+                            verifying), and a fresh RSA key signs all future
+                            id_tokens.
+                        </p>
+                    </div>
+                    <DialogFooter>
+                        <Button
+                            variant="outline"
+                            onClick={() => setConfirmRotateKey(false)}
+                            disabled={rotateSigningKey.isPending}
+                        >
+                            Cancel
+                        </Button>
+                        <Button
+                            onClick={handleRotateKeyConfirmed}
+                            disabled={rotateSigningKey.isPending}
+                        >
+                            {rotateSigningKey.isPending
+                                ? "Rotating…"
+                                : "Rotate key"}
+                        </Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
+
+            <Dialog
+                open={!!editingScope}
+                onOpenChange={(open) => !open && setEditingScope(null)}
+            >
+                <DialogContent className="sm:max-w-md">
+                    <DialogHeader>
+                        <DialogTitle>Edit Scope</DialogTitle>
+                    </DialogHeader>
+                    {editingScope ? (
+                        <div className="space-y-3 py-1">
+                            <div>
+                                <p className="mb-2 text-xs text-muted-foreground">
+                                    Scope key
+                                </p>
+                                <div className="rounded-md border bg-secondary px-3 py-2 text-sm dark:bg-secondary">
+                                    {editingScope.scope}
+                                </div>
+                            </div>
+                            <div>
+                                <p className="mb-2 text-xs text-muted-foreground">
+                                    Display name
+                                </p>
+                                <Input
+                                    value={editingScope.display_name}
+                                    onChange={(e) =>
+                                        setEditingScope({
+                                            ...editingScope,
+                                            display_name: e.target.value,
+                                        })
+                                    }
+                                />
+                            </div>
+                            <div>
+                                <p className="mb-2 text-xs text-muted-foreground">
+                                    Description
+                                </p>
+                                <Textarea
+                                    value={editingScope.description}
+                                    onChange={(e) =>
+                                        setEditingScope({
+                                            ...editingScope,
+                                            description: e.target.value,
+                                        })
+                                    }
+                                    rows={3}
+                                />
+                            </div>
+                            <div className="flex items-center justify-between">
+                                <p className="text-sm">Archived</p>
+                                <Switch
+                                    checked={editingScope.archived}
+                                    onCheckedChange={(checked) =>
+                                        setEditingScope({
+                                            ...editingScope,
+                                            archived: checked,
+                                        })
+                                    }
+                                />
+                            </div>
+
+                            <div>
+                                <p className="mb-2 text-xs text-muted-foreground">
+                                    Category
+                                </p>
+                                <Select
+                                    value={editingScope.category || "__unset__"}
+                                    disabled={isCategoryLocked}
+                                    onValueChange={(value) =>
+                                        setEditingScope({
+                                            ...editingScope,
+                                            category:
+                                                value === "__unset__"
+                                                    ? ""
+                                                    : (value as OAuthScopeDefinition["category"]),
+                                            organization_permission:
+                                                value === "organization"
+                                                    ? editingScope.organization_permission
+                                                    : undefined,
+                                            workspace_permission:
+                                                value === "workspace"
+                                                    ? editingScope.workspace_permission
+                                                    : undefined,
+                                        })
+                                    }
+                                >
+                                    <SelectTrigger className="w-full">
+                                        <SelectValue placeholder="Select category" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        <SelectItem value="__unset__">
+                                            Unset
+                                        </SelectItem>
+                                        <SelectItem value="personal">
+                                            Personal
+                                        </SelectItem>
+                                        <SelectItem value="organization">
+                                            Organization
+                                        </SelectItem>
+                                        <SelectItem value="workspace">
+                                            Workspace
+                                        </SelectItem>
+                                    </SelectContent>
+                                </Select>
+                            </div>
+
+                            {editingScope.category === "organization" ? (
+                                <div>
+                                    <p className="mb-2 text-xs text-muted-foreground">
+                                        Required Organization Permission
+                                    </p>
+                                    <Select
+                                        value={
+                                            editingScope.organization_permission ||
+                                            "__none__"
+                                        }
+                                        disabled={isOrganizationPermissionLocked}
+                                        onValueChange={(value) =>
+                                            setEditingScope({
+                                                ...editingScope,
+                                                organization_permission:
+                                                    value === "__none__"
+                                                        ? undefined
+                                                        : value,
+                                            })
+                                        }
+                                    >
+                                        <SelectTrigger className="w-full">
+                                            <SelectValue placeholder="No permission required" />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                            <SelectItem value="__none__">
+                                                No permission required
+                                            </SelectItem>
+                                            {organizationPermissions.map(
+                                                (permission) => (
+                                                    <SelectItem
+                                                        key={permission}
+                                                        value={permission}
+                                                    >
+                                                        {permission}
+                                                    </SelectItem>
+                                                ),
+                                            )}
+                                        </SelectContent>
+                                    </Select>
+                                </div>
+                            ) : null}
+
+                            {editingScope.category === "workspace" ? (
+                                <div>
+                                    <p className="mb-2 text-xs text-muted-foreground">
+                                        Attach Workspace Permission
+                                    </p>
+                                    <Select
+                                        value={
+                                            editingScope.workspace_permission ||
+                                            "__none__"
+                                        }
+                                        disabled={isWorkspacePermissionLocked}
+                                        onValueChange={(value) =>
+                                            setEditingScope({
+                                                ...editingScope,
+                                                workspace_permission:
+                                                    value === "__none__"
+                                                        ? undefined
+                                                        : value,
+                                            })
+                                        }
+                                    >
+                                        <SelectTrigger className="w-full">
+                                            <SelectValue placeholder="No workspace permission attached" />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                            <SelectItem value="__none__">
+                                                No workspace permission attached
+                                            </SelectItem>
+                                            {workspacePermissions.map(
+                                                (permission) => (
+                                                    <SelectItem
+                                                        key={permission}
+                                                        value={permission}
+                                                    >
+                                                        {permission}
+                                                    </SelectItem>
+                                                ),
+                                            )}
+                                        </SelectContent>
+                                    </Select>
+                                </div>
+                            ) : null}
+                        </div>
+                    ) : null}
+                    <DialogFooter>
+                        <Button
+                            type="button"
+                            variant="ghost"
+                            disabled={isScopeSavePending}
+                            onClick={() => setEditingScope(null)}
+                        >
+                            Cancel
+                        </Button>
+                        <Button
+                            type="button"
+                            onClick={saveScopeEditor}
+                            disabled={isScopeSavePending}
+                        >
+                            {isScopeSavePending ? "Saving..." : "Save"}
+                        </Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
+        </>
+    );
+}
+
+function SigningKeysSection({
+    oauthAppSlug,
+    keys,
+    isLoading,
+}: {
+    oauthAppSlug: string;
+    keys: OAuthAppSigningKey[];
+    isLoading: boolean;
+}) {
+    const compromise = useCompromiseOAuthAppSigningKey(oauthAppSlug);
+    const [confirmCompromise, setConfirmCompromise] = useState<string | null>(
+        null,
+    );
+
+    const sorted = useMemo(() => {
+        const order = { active: 0, retired: 1, compromised: 2 } as const;
+        return [...keys].sort(
+            (a, b) =>
+                (order[a.status as keyof typeof order] ?? 9) -
+                (order[b.status as keyof typeof order] ?? 9),
+        );
+    }, [keys]);
+
+    const downloadPem = (kid: string, pem: string) => {
+        const blob = new Blob([pem], { type: "application/x-pem-file" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${oauthAppSlug}-${kid}.pem`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    };
+
+    const handleCompromiseConfirmed = async () => {
+        if (!confirmCompromise) return;
+        try {
+            await compromise.mutateAsync(confirmCompromise);
+        } catch {
+            // onError already surfaced a toast
+        } finally {
+            setConfirmCompromise(null);
+        }
+    };
+
+    return (
+        <div className="space-y-6">
+            <section className="space-y-3">
+                <div>
+                    <p className="font-mono text-[10px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+                        OIDC
+                    </p>
+                    <h2 className="mt-1 text-base font-medium text-foreground">
+                        Signing keys
+                    </h2>
+                </div>
+
+                <Table>
+                    <TableHeader>
+                        <TableRow>
+                            <TableHead>Key ID</TableHead>
+                            <TableHead className="w-28">Algorithm</TableHead>
+                            <TableHead className="w-28">Status</TableHead>
+                            <TableHead className="text-right">
+                                Actions
+                            </TableHead>
+                        </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                        {isLoading ? (
+                            <SkeletonTableRows
+                                rows={3}
+                                columns={4}
+                                withAvatar={false}
+                            />
+                        ) : sorted.length === 0 ? (
+                            <TableEmptyRow
+                                colSpan={4}
+                                title="No signing keys yet"
+                                description={`Use "Rotate key" above to generate the first signing key.`}
+                            />
+                        ) : (
+                            sorted.map((key) => (
+                                <TableRow key={key.kid}>
+                                    <TableCell className="font-mono text-xs text-foreground">
+                                        {key.kid}
+                                    </TableCell>
+                                    <TableCell>
+                                        <Tag>{key.algorithm}</Tag>
+                                    </TableCell>
+                                    <TableCell>
+                                        <Pill
+                                            tone={
+                                                key.status === "active"
+                                                    ? "ok"
+                                                    : key.status === "retired"
+                                                      ? "warn"
+                                                      : "err"
+                                            }
+                                        >
+                                            {key.status}
+                                        </Pill>
+                                    </TableCell>
+                                    <TableCell className="text-right">
+                                        <div className="flex items-center justify-end gap-2">
+                                            <Button
+                                                variant="outline"
+                                                size="sm"
+                                                className="h-7 px-2.5 text-[11px]"
+                                                onClick={() =>
+                                                    downloadPem(
+                                                        key.kid,
+                                                        key.public_key_pem,
+                                                    )
+                                                }
+                                            >
+                                                Download PEM
+                                            </Button>
+                                            {key.status !== "compromised" && (
+                                                <Button
+                                                    variant="outline"
+                                                    size="sm"
+                                                    className="h-7 px-2.5 text-[11px] text-destructive hover:text-destructive"
+                                                    onClick={() =>
+                                                        setConfirmCompromise(
+                                                            key.kid,
+                                                        )
+                                                    }
+                                                >
+                                                    Mark compromised
+                                                </Button>
+                                            )}
+                                        </div>
+                                    </TableCell>
+                                </TableRow>
+                            ))
+                        )}
+                    </TableBody>
+                </Table>
+            </section>
+
+            <Dialog
+                open={!!confirmCompromise}
+                onOpenChange={(open) => {
+                    if (!open && !compromise.isPending)
+                        setConfirmCompromise(null);
+                }}
+            >
+                <DialogContent className="sm:max-w-md">
+                    <DialogHeader>
+                        <DialogTitle>Mark key as compromised?</DialogTitle>
+                    </DialogHeader>
+                    <div className="space-y-3 text-sm">
+                        <p>
+                            This is destructive. The key will be removed from
+                            JWKS immediately, and every id_token signed by it
+                            will stop verifying. Use only when you suspect the
+                            private key has leaked.
+                        </p>
+                        <p className="font-mono text-xs break-all text-muted-foreground">
+                            {confirmCompromise}
+                        </p>
+                    </div>
+                    <DialogFooter>
+                        <Button
+                            variant="outline"
+                            onClick={() => setConfirmCompromise(null)}
+                            disabled={compromise.isPending}
+                        >
+                            Cancel
+                        </Button>
+                        <Button
+                            variant="destructive"
+                            disabled={compromise.isPending}
+                            onClick={handleCompromiseConfirmed}
+                        >
+                            {compromise.isPending
+                                ? "Marking..."
+                                : "Mark compromised"}
+                        </Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
+        </div>
+    );
+}

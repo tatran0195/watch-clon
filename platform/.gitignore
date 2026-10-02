@@ -1,0 +1,6 @@
+/target
+.env
+.aider*
+
+.DS_Store
+.runtime

@@ -1,0 +1,111 @@
+import { useState } from "react";
+import { Button } from "../ui/button";
+import { Input } from "../ui/input";
+import { Textarea } from "../ui/textarea";
+import { Label } from "../ui/label";
+import {
+	Dialog,
+	DialogContent,
+	DialogHeader,
+	DialogFooter,
+	DialogDescription,
+	DialogTitle,
+} from "../ui/dialog";
+
+interface CreateKnowledgeBaseFormDialogProps {
+	open: boolean;
+	onClose: () => void;
+	onCreate: (name: string, description?: string) => Promise<void>;
+}
+
+interface KnowledgeBaseFormData {
+	name: string;
+	description: string;
+}
+
+export function CreateKnowledgeBaseFormDialog({
+	open,
+	onClose,
+	onCreate,
+}: CreateKnowledgeBaseFormDialogProps) {
+	const [formData, setFormData] = useState<KnowledgeBaseFormData>({
+		name: "",
+		description: "",
+	});
+	const [isSubmitting, setIsSubmitting] = useState(false);
+
+	const handleSubmit = async (e: React.FormEvent) => {
+		e.preventDefault();
+
+		if (!formData.name.trim()) {
+			return;
+		}
+
+		setIsSubmitting(true);
+		try {
+			await onCreate(formData.name.trim(), formData.description.trim() || undefined);
+			setFormData({ name: "", description: "" });
+		} catch (error) {
+			console.error("Error creating knowledge base:", error);
+		} finally {
+			setIsSubmitting(false);
+		}
+	};
+
+	const handleClose = () => {
+		setFormData({ name: "", description: "" });
+		onClose();
+	};
+
+	return (
+		<Dialog open={open} onOpenChange={(val) => !val && handleClose()}>
+			<DialogContent className="sm:max-w-md">
+				<DialogHeader>
+					<DialogTitle>Create Knowledge Base</DialogTitle>
+					<DialogDescription>
+						Create a new knowledge base to organize and store documents that AI agents can reference.
+					</DialogDescription>
+				</DialogHeader>
+
+				<form onSubmit={handleSubmit}>
+					<div className="space-y-4 py-4">
+						<div className="space-y-2">
+							<Label>Name</Label>
+							<Input
+								required
+								placeholder="Enter knowledge base name"
+								value={formData.name}
+								onChange={(e) =>
+									setFormData({ ...formData, name: e.target.value })
+								}
+							/>
+						</div>
+
+						<div className="space-y-2">
+							<Label>Description</Label>
+							<Textarea
+								placeholder="Describe the purpose of this knowledge base"
+								value={formData.description}
+								onChange={(e) =>
+									setFormData({ ...formData, description: e.target.value })
+								}
+							/>
+						</div>
+					</div>
+
+					<DialogFooter>
+						<Button type="button" variant="outline" onClick={handleClose}>
+							Cancel
+						</Button>
+						<Button
+							type="submit"
+							disabled={!formData.name.trim() || isSubmitting}
+						>
+							{isSubmitting ? "Creating..." : "Create Knowledge Base"}
+						</Button>
+					</DialogFooter>
+				</form>
+			</DialogContent>
+		</Dialog>
+	);
+}

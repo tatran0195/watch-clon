@@ -1,0 +1,42 @@
+[package]
+name = "agent-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Workspace dependencies
+commands = { path = "../commands" }
+queries = { path = "../queries" }
+models = { path = "../models" }
+common = { path = "../common" }
+dto = { path = "../dto" }
+templatekit = { path = "../templatekit" }
+
+# External dependencies
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+futures = "0.3"
+async-nats = "0.42.0"
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
+tokio-stream = "0.1"
+rand = "0.8"
+regex = "1.10"
+strsim = "0.11"
+scraper = "0.22"
+handlebars = "6.2.0"
+tiktoken-rs = "0.5"
+quick-xml = { version = "0.38.0", features = ["serialize"] }
+urlencoding = "2.1"
+base64 = "0.22.1"
+redis = { version = "0.29.5", features = ["tokio-comp"] }
+flate2 = "1.0"
+rmcp = { version = "0.8.5", features = ["client", "transport-streamable-http-client-reqwest"] }
+sha2 = "0.10"
+libc = "0.2"
+shellish_parse = "2.2"
+thiserror = "1.0"
+wacht-sandbox-client = { git = "https://github.com/wacht-platform/sandbox-client", branch = "main" }

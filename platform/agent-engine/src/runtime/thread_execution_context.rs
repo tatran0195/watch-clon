@@ -1,0 +1,392 @@
+use std::sync::Arc;
+
+use common::error::AppError;
+use common::state::AppState;
+use models::{
+    default_embedding_dimension, is_supported_embedding_dimension, AgentThreadState,
+    AiAgentWithFeatures, DeploymentAiProviderProfile, DeploymentAiSettings,
+};
+use queries::GetAgentThreadStateQuery;
+use tokio::sync::RwLock;
+
+use crate::llm::{GeminiClient, LlmRole, OpenAiClient, OpenRouterClient, ResolvedLlm};
+use crate::runtime::vector_store::VectorStore;
+
+#[derive(Debug, Clone, Default)]
+pub struct DeploymentProviderKeys {
+    pub strong_llm_provider: Option<String>,
+    pub weak_llm_provider: Option<String>,
+    pub gemini_api_key: Option<String>,
+    pub openrouter_api_key: Option<String>,
+    pub openrouter_require_parameters: bool,
+    pub openai_api_key: Option<String>,
+    pub anthropic_api_key: Option<String>,
+    pub strong_model: Option<String>,
+    pub weak_model: Option<String>,
+    pub embedding_dimension: i32,
+    pub provider_profiles: Vec<ResolvedProviderProfile>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedProviderProfile {
+    pub id: i64,
+    pub provider: String,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    pub organization: Option<String>,
+    pub project: Option<String>,
+    pub default_model: Option<String>,
+    pub disable_prompt_caching: bool,
+    pub disable_reasoning_effort: bool,
+    pub supports_image: bool,
+}
+
+impl DeploymentProviderKeys {
+    pub fn from_settings(
+        settings: Option<&DeploymentAiSettings>,
+        profiles: &[DeploymentAiProviderProfile],
+        encryption_service: &common::EncryptionService,
+    ) -> Result<Self, AppError> {
+        let embedding_dimension = settings
+            .map(|s| s.embedding_dimension)
+            .unwrap_or_else(default_embedding_dimension);
+        if !is_supported_embedding_dimension(embedding_dimension) {
+            return Err(AppError::Validation(format!(
+                "Unsupported deployment embedding dimension: {}",
+                embedding_dimension
+            )));
+        }
+
+        Ok(Self {
+            strong_llm_provider: settings.map(|s| s.strong_llm_provider.clone()),
+            weak_llm_provider: settings.map(|s| s.weak_llm_provider.clone()),
+            gemini_api_key: settings
+                .and_then(|s| s.gemini_api_key.as_deref())
+                .map(|value| encryption_service.decrypt(value))
+                .transpose()?,
+            openrouter_api_key: settings
+                .and_then(|s| s.openrouter_api_key.as_deref())
+                .map(|value| encryption_service.decrypt(value))
+                .transpose()?,
+            openrouter_require_parameters: settings
+                .map(|s| s.openrouter_require_parameters)
+                .unwrap_or(true),
+            openai_api_key: settings
+                .and_then(|s| s.openai_api_key.as_deref())
+                .map(|value| encryption_service.decrypt(value))
+                .transpose()?,
+            anthropic_api_key: settings
+                .and_then(|s| s.anthropic_api_key.as_deref())
+                .map(|value| encryption_service.decrypt(value))
+                .transpose()?,
+            strong_model: settings.and_then(|s| s.strong_model.clone()),
+            weak_model: settings.and_then(|s| s.weak_model.clone()),
+            embedding_dimension,
+            provider_profiles: profiles
+                .iter()
+                .filter(|profile| profile.enabled)
+                .map(|profile| {
+                    Ok(ResolvedProviderProfile {
+                        id: profile.id,
+                        provider: profile.provider.clone(),
+                        api_key: profile
+                            .api_key
+                            .as_deref()
+                            .map(|value| encryption_service.decrypt(value))
+                            .transpose()?,
+                        base_url: profile.base_url.clone(),
+                        organization: profile.organization.clone(),
+                        project: profile.project.clone(),
+                        default_model: profile.default_model.clone(),
+                        disable_prompt_caching: profile.disable_prompt_caching,
+                        disable_reasoning_effort: profile.disable_reasoning_effort,
+                        supports_image: profile.supports_image,
+                    })
+                })
+                .collect::<Result<Vec<_>, AppError>>()?,
+        })
+    }
+}
+
+pub struct ThreadExecutionContext {
+    pub app_state: AppState,
+    pub agent: AiAgentWithFeatures,
+    pub thread_id: i64,
+    pub actor_id: i64,
+    pub execution_run_id: i64,
+    pub provider_keys: DeploymentProviderKeys,
+    pub vector_store: Arc<dyn VectorStore>,
+    cached_thread: RwLock<Option<AgentThreadState>>,
+}
+
+impl ThreadExecutionContext {
+    fn agent_override_for(&self, role: LlmRole) -> Option<&models::AgentModelOverride> {
+        let candidate = match role {
+            LlmRole::Strong => self.agent.strong_model.as_ref(),
+            LlmRole::Weak => self.agent.weak_model.as_ref(),
+        }?;
+        let has_provider_override = candidate
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+            && candidate
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some();
+        if !has_provider_override && candidate.profile_id.is_none() {
+            return None;
+        }
+        Some(candidate)
+    }
+
+    fn agent_profile_for(&self, role: LlmRole) -> Option<&ResolvedProviderProfile> {
+        let profile_id = self.agent_override_for(role)?.profile_id?;
+        self.provider_keys
+            .provider_profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+    }
+
+    /// True when the provider profile resolved for `role` opted out of explicit
+    /// prompt caching. No profile (deployment-default keys) means caching stays on.
+    pub(crate) fn prompt_caching_disabled(&self, role: LlmRole) -> bool {
+        self.agent_profile_for(role)
+            .map(|profile| profile.disable_prompt_caching)
+            .unwrap_or(false)
+    }
+
+    /// True when the provider profile resolved for `role` opted out of sending a
+    /// `reasoning_effort`. Set this for models that don't support reasoning /
+    /// thinking levels (the param errors otherwise). No profile means it stays on.
+    pub(crate) fn reasoning_effort_disabled(&self, role: LlmRole) -> bool {
+        self.agent_profile_for(role)
+            .map(|profile| profile.disable_reasoning_effort)
+            .unwrap_or(false)
+    }
+
+    /// True when the provider profile resolved for `role` does not support image
+    /// input. No profile (deployment-default keys) means images are supported.
+    pub(crate) fn image_support_disabled(&self, role: LlmRole) -> bool {
+        self.agent_profile_for(role)
+            .map(|profile| !profile.supports_image)
+            .unwrap_or(false)
+    }
+
+    fn ensure_agent_profile_available(&self, role: LlmRole) -> Result<(), AppError> {
+        let Some(profile_id) = self
+            .agent_override_for(role)
+            .and_then(|override_| override_.profile_id)
+        else {
+            return Ok(());
+        };
+        if self.agent_profile_for(role).is_none() {
+            return Err(AppError::BadRequest(format!(
+                "Agent model profile {} is not available for this deployment",
+                profile_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn llm_provider(&self, role: LlmRole) -> &str {
+        if let Some(profile) = self.agent_profile_for(role) {
+            return profile.provider.as_str();
+        }
+        if let Some(over) = self.agent_override_for(role) {
+            if let Some(provider) = over.provider.as_deref().filter(|value| !value.is_empty()) {
+                return provider;
+            }
+        }
+        let provider = match role {
+            LlmRole::Strong => self.provider_keys.strong_llm_provider.as_deref(),
+            LlmRole::Weak => self.provider_keys.weak_llm_provider.as_deref(),
+        };
+        provider
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("gemini")
+    }
+
+    fn resolve_model_name(&self, role: LlmRole) -> &str {
+        if let Some(over) = self.agent_override_for(role) {
+            if let Some(model) = over.model.as_deref().filter(|value| !value.is_empty()) {
+                return model;
+            }
+        }
+        if let Some(profile) = self.agent_profile_for(role) {
+            if let Some(model) = profile
+                .default_model
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                return model;
+            }
+        }
+        let deployment_default = match role {
+            LlmRole::Strong => self.provider_keys.strong_model.as_deref(),
+            LlmRole::Weak => self.provider_keys.weak_model.as_deref(),
+        };
+        if let Some(value) = deployment_default.filter(|v| !v.trim().is_empty()) {
+            return value;
+        }
+        let provider = self.llm_provider(role);
+        let fallback = match (role, provider) {
+            (LlmRole::Strong, "openrouter") | (LlmRole::Weak, "openrouter") => {
+                "nvidia/nemotron-3-super-120b-a12b:free"
+            }
+            (LlmRole::Strong, "openai") => "gpt-5.1",
+            (LlmRole::Weak, "openai") => "gpt-5-mini",
+            (LlmRole::Strong, _) => "gemini-3.1-pro-preview",
+            (LlmRole::Weak, _) => "gemini-3-flash-preview",
+        };
+        tracing::warn!(
+            deployment_id = self.agent.deployment_id,
+            agent_id = self.agent.id,
+            role = ?role,
+            provider,
+            fallback,
+            "LLM model not configured (no agent override, no deployment default); using hardcoded fallback",
+        );
+        fallback
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_thread(
+        app_state: AppState,
+        agent: AiAgentWithFeatures,
+        thread_id: i64,
+        actor_id: i64,
+        execution_run_id: i64,
+        provider_keys: DeploymentProviderKeys,
+        vector_store: Arc<dyn VectorStore>,
+        cached_thread: Option<AgentThreadState>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            app_state,
+            agent,
+            thread_id,
+            actor_id,
+            execution_run_id,
+            provider_keys,
+            vector_store,
+            cached_thread: RwLock::new(cached_thread),
+        })
+    }
+
+    pub fn with_agent(self: &Arc<Self>, agent: AiAgentWithFeatures) -> Arc<Self> {
+        let carried_thread = self
+            .cached_thread
+            .try_read()
+            .ok()
+            .and_then(|guard| guard.clone());
+        Arc::new(Self {
+            app_state: self.app_state.clone(),
+            agent,
+            thread_id: self.thread_id,
+            actor_id: self.actor_id,
+            execution_run_id: self.execution_run_id,
+            provider_keys: self.provider_keys.clone(),
+            vector_store: self.vector_store.clone(),
+            cached_thread: RwLock::new(carried_thread),
+        })
+    }
+
+    pub async fn get_thread(&self) -> Result<AgentThreadState, AppError> {
+        {
+            let cache = self.cached_thread.read().await;
+            if let Some(thread) = cache.as_ref() {
+                return Ok(thread.clone());
+            }
+        }
+
+        let thread = GetAgentThreadStateQuery::new(self.thread_id, self.agent.deployment_id)
+            .execute_with_db(self.app_state.db_router.writer())
+            .await?;
+
+        {
+            let mut cache = self.cached_thread.write().await;
+            *cache = Some(thread.clone());
+        }
+
+        Ok(thread)
+    }
+
+    /// Get the thread title (cached)
+    pub async fn thread_title(&self) -> Result<String, AppError> {
+        let thread = self.get_thread().await?;
+        if thread.title.is_empty() {
+            Ok(format!("Thread {}", self.thread_id))
+        } else {
+            Ok(thread.title)
+        }
+    }
+
+    pub fn invalidate_cache(&self) {
+        if let Ok(mut cache) = self.cached_thread.try_write() {
+            *cache = None;
+        }
+    }
+
+    pub async fn create_llm(&self, role: LlmRole) -> Result<ResolvedLlm, AppError> {
+        self.ensure_agent_profile_available(role)?;
+        let model = self.resolve_model_name(role);
+        let provider = self.llm_provider(role);
+        match provider {
+            "openrouter" => {
+                let client = OpenRouterClient::from_api_key(
+                    self.provider_keys.openrouter_api_key.clone(),
+                    model,
+                    self.provider_keys.openrouter_require_parameters,
+                )?
+                .with_billing_context(
+                    self.agent.deployment_id,
+                    self.thread_id,
+                    self.actor_id,
+                    self.app_state.nats_client.clone(),
+                );
+                return Ok(ResolvedLlm::new(Arc::new(client), model));
+            }
+            "openai" => {
+                let client = if let Some(profile) = self.agent_profile_for(role) {
+                    OpenAiClient::from_profile(
+                        profile.api_key.clone(),
+                        model,
+                        profile.base_url.clone(),
+                        profile.organization.clone(),
+                        profile.project.clone(),
+                    )?
+                } else {
+                    OpenAiClient::from_api_key(self.provider_keys.openai_api_key.clone(), model)?
+                }
+                .with_billing_context(
+                    self.agent.deployment_id,
+                    self.thread_id,
+                    self.actor_id,
+                    self.app_state.nats_client.clone(),
+                );
+                return Ok(ResolvedLlm::new(Arc::new(client), model));
+            }
+            _ => {}
+        }
+
+        let client = GeminiClient::from_api_key(
+            self.provider_keys.gemini_api_key.clone(),
+            model,
+            self.agent.deployment_id,
+            self.thread_id,
+            self.actor_id,
+            self.app_state.redis_client.clone(),
+            self.app_state.nats_client.clone(),
+        )?;
+        Ok(ResolvedLlm::new(Arc::new(client), model))
+    }
+
+    pub async fn get_thread_by_id(&self, thread_id: i64) -> Result<AgentThreadState, AppError> {
+        GetAgentThreadStateQuery::new(thread_id, self.agent.deployment_id)
+            .execute_with_db(self.app_state.db_router.writer())
+            .await
+    }
+}

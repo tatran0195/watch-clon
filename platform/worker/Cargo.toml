@@ -1,0 +1,32 @@
+[package]
+name = "platform-worker"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[dependencies]
+models = { path = "../models" }
+dto = { path = "../dto" }
+commands = { path = "../commands" }
+queries = { path = "../queries" }
+common = { path = "../common" }
+agent-engine = { path = "../agent-engine" }
+async-nats = "0.42.0"
+tokio = { version = "1.35", features = ["full"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opentelemetry = { version = "0.31", features = ["metrics"] }
+dotenvy = "0.15.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+redis = "0.29.5"
+rust_decimal = "1.36"
+base64 = "0.22"
+infer = "0.15"

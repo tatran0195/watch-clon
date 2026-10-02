@@ -1,0 +1,303 @@
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+};
+use commands::{
+    enterprise_connection::{
+        CreateEnterpriseConnectionRequest, DeleteEnterpriseConnectionRequest,
+        UpdateEnterpriseConnectionRequest,
+    },
+    organization_domain::{
+        CreateOrganizationDomainRequest, CreateOrganizationDomainResponse,
+        DeleteOrganizationDomainRequest, VerifyOrganizationDomainRequest,
+        VerifyOrganizationDomainResponse,
+    },
+    scim_token::{GenerateScimTokenRequest, RevokeScimTokenRequest},
+};
+use common::state::AppState;
+use models::{
+    enterprise_connection::EnterpriseConnection, organization_domain::OrganizationDomain,
+    scim_token::ScimToken,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+use crate::api::pagination::paginate_results;
+use crate::application::enterprise_sso::{
+    ListInput, TestConnectionResult, TestEnterpriseConnectionConfig, create_connection,
+    create_domain, delete_connection, delete_domain, generate_scim_token, get_scim_token,
+    list_connections, list_domains, revoke_scim_token, test_connection_config,
+    test_existing_connection, update_connection, verify_domain,
+};
+use crate::application::response::{ApiResult, PaginatedResponse};
+use crate::middleware::RequireDeployment;
+
+const DEFAULT_FRONTEND_API_URL: &str = "https://api.wacht.dev";
+
+fn resolve_list_pagination(params: &ListQueryParams) -> (i32, i64) {
+    let limit = params.limit.unwrap_or(50);
+    let offset = params.offset.unwrap_or(0);
+    (limit, offset)
+}
+
+fn scim_base_url(connection_id: i64) -> String {
+    let base =
+        std::env::var("FRONTEND_API_URL").unwrap_or_else(|_| DEFAULT_FRONTEND_API_URL.to_string());
+    format!("{}/scim/v2/{}", base, connection_id)
+}
+
+fn build_scim_token_details(token: &ScimToken, plain_token: Option<String>) -> ScimTokenDetails {
+    ScimTokenDetails {
+        token: plain_token,
+        token_prefix: token.token_prefix.clone(),
+        enabled: token.enabled,
+        created_at: token.created_at.to_rfc3339(),
+        updated_at: token.updated_at.to_rfc3339(),
+        last_used_at: token.last_used_at.map(|dt| dt.to_rfc3339()),
+    }
+}
+
+fn build_scim_token_response(
+    connection_id: i64,
+    token: Option<ScimTokenDetails>,
+) -> ScimTokenInfoResponse {
+    ScimTokenInfoResponse {
+        exists: token.is_some(),
+        scim_base_url: scim_base_url(connection_id),
+        token,
+    }
+}
+
+#[derive(Deserialize)]
+pub struct OrganizationParams {
+    #[serde(flatten)]
+    pub rest: HashMap<String, String>,
+    pub org_id: i64,
+}
+
+#[derive(Deserialize)]
+pub struct DomainParams {
+    #[serde(flatten)]
+    pub rest: HashMap<String, String>,
+    pub org_id: i64,
+    pub domain_id: i64,
+}
+
+#[derive(Deserialize)]
+pub struct ConnectionParams {
+    #[serde(flatten)]
+    pub rest: HashMap<String, String>,
+    pub org_id: i64,
+    pub connection_id: i64,
+}
+
+#[derive(Deserialize, Default)]
+pub struct ListQueryParams {
+    pub limit: Option<i32>,
+    pub offset: Option<i64>,
+}
+
+// --- Domain Handlers ---
+
+pub async fn list_domains_handler(
+    State(app_state): State<AppState>,
+    RequireDeployment(deployment_id): RequireDeployment,
+    Path(params): Path<OrganizationParams>,
+    Query(query_params): Query<ListQueryParams>,
+) -> ApiResult<PaginatedResponse<OrganizationDomain>> {
+    let (limit, offset) = resolve_list_pagination(&query_params);
+
+    let input = ListInput::new(deployment_id, params.org_id, limit + 1, offset);
+    let domains = list_domains(&app_state, input).await?;
+
+    Ok(paginate_results(domains, limit, Some(offset)).into())
+}
+
+pub async fn create_domain_handler(
+    State(app_state): State<AppState>,
+    RequireDeployment(deployment_id): RequireDeployment,
+    Path(params): Path<OrganizationParams>,
+    Json(mut req): Json<CreateOrganizationDomainRequest>,
+) -> ApiResult<CreateOrganizationDomainResponse> {
+    req.organization_id = params.org_id;
+    let created = create_domain(&app_state, deployment_id, req).await?;
+    Ok(created.into())
+}
+
+pub async fn delete_domain_handler(
+    State(app_state): State<AppState>,
+    RequireDeployment(deployment_id): RequireDeployment,
+    Path(params): Path<DomainParams>,
+) -> ApiResult<()> {
+    let req = DeleteOrganizationDomainRequest {
+        organization_id: params.org_id,
+        domain_id: params.domain_id,
+    };
+    delete_domain(&app_state, deployment_id, req).await?;
+    Ok(().into())
+}
+
+pub async fn verify_domain_handler(
+    State(app_state): State<AppState>,
+    RequireDeployment(deployment_id): RequireDeployment,
+    Path(params): Path<DomainParams>,
+) -> ApiResult<VerifyOrganizationDomainResponse> {
+    let req = VerifyOrganizationDomainRequest {
+        organization_id: params.org_id,
+        domain_id: params.domain_id,
+    };
+    let verified = verify_domain(&app_state, deployment_id, req).await?;
+    Ok(verified.into())
+}
+
+// --- Connection Handlers ---
+
+pub async fn list_connections_handler(
+    State(app_state): State<AppState>,
+    RequireDeployment(deployment_id): RequireDeployment,
+    Path(params): Path<OrganizationParams>,
+    Query(query_params): Query<ListQueryParams>,
+) -> ApiResult<PaginatedResponse<EnterpriseConnection>> {
+    let (limit, offset) = resolve_list_pagination(&query_params);
+
+    let input = ListInput::new(deployment_id, params.org_id, limit + 1, offset);
+    let connections = list_connections(&app_state, input).await?;
+
+    Ok(paginate_results(connections, limit, Some(offset)).into())
+}
+
+pub async fn create_connection_handler(
+    State(app_state): State<AppState>,
+    RequireDeployment(deployment_id): RequireDeployment,
+    Path(params): Path<OrganizationParams>,
+    Json(mut req): Json<CreateEnterpriseConnectionRequest>,
+) -> ApiResult<EnterpriseConnection> {
+    req.organization_id = params.org_id;
+    let connection = create_connection(&app_state, deployment_id, req).await?;
+    Ok(connection.into())
+}
+
+pub async fn update_connection_handler(
+    State(app_state): State<AppState>,
+    RequireDeployment(deployment_id): RequireDeployment,
+    Path(params): Path<ConnectionParams>,
+    Json(mut req): Json<UpdateEnterpriseConnectionRequest>,
+) -> ApiResult<EnterpriseConnection> {
+    req.organization_id = params.org_id;
+    req.connection_id = params.connection_id;
+    let connection = update_connection(&app_state, deployment_id, req).await?;
+    Ok(connection.into())
+}
+
+pub async fn delete_connection_handler(
+    State(app_state): State<AppState>,
+    RequireDeployment(deployment_id): RequireDeployment,
+    Path(params): Path<ConnectionParams>,
+) -> ApiResult<()> {
+    let req = DeleteEnterpriseConnectionRequest {
+        organization_id: params.org_id,
+        connection_id: params.connection_id,
+    };
+    delete_connection(&app_state, deployment_id, req).await?;
+    Ok(().into())
+}
+
+#[derive(Serialize)]
+pub struct ScimTokenInfoResponse {
+    pub exists: bool,
+    pub scim_base_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<ScimTokenDetails>,
+}
+
+#[derive(Serialize)]
+pub struct ScimTokenDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub token_prefix: String,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+}
+
+pub async fn get_scim_token_handler(
+    State(app_state): State<AppState>,
+    RequireDeployment(deployment_id): RequireDeployment,
+    Path(params): Path<ConnectionParams>,
+) -> ApiResult<ScimTokenInfoResponse> {
+    let token = get_scim_token(
+        &app_state,
+        deployment_id,
+        params.org_id,
+        params.connection_id,
+    )
+    .await?;
+
+    let response = build_scim_token_response(
+        params.connection_id,
+        token
+            .as_ref()
+            .map(|scim_token| build_scim_token_details(scim_token, None)),
+    );
+
+    Ok(response.into())
+}
+
+pub async fn generate_scim_token_handler(
+    State(app_state): State<AppState>,
+    RequireDeployment(deployment_id): RequireDeployment,
+    Path(params): Path<ConnectionParams>,
+) -> ApiResult<ScimTokenInfoResponse> {
+    let req = GenerateScimTokenRequest {
+        organization_id: params.org_id,
+        connection_id: params.connection_id,
+    };
+
+    let result = generate_scim_token(&app_state, deployment_id, req).await?;
+
+    let token = build_scim_token_details(&result.token, Some(result.plain_token));
+    let response = build_scim_token_response(params.connection_id, Some(token));
+
+    Ok(response.into())
+}
+
+pub async fn revoke_scim_token_handler(
+    State(app_state): State<AppState>,
+    RequireDeployment(deployment_id): RequireDeployment,
+    Path(params): Path<ConnectionParams>,
+) -> ApiResult<()> {
+    let req = RevokeScimTokenRequest {
+        organization_id: params.org_id,
+        connection_id: params.connection_id,
+    };
+
+    revoke_scim_token(&app_state, deployment_id, req).await?;
+    Ok(().into())
+}
+
+pub async fn test_connection_config_handler(
+    State(_app_state): State<AppState>,
+    RequireDeployment(_deployment_id): RequireDeployment,
+    Path(_params): Path<OrganizationParams>,
+    Json(req): Json<TestEnterpriseConnectionConfig>,
+) -> ApiResult<TestConnectionResult> {
+    let result = test_connection_config(req).await;
+    Ok(result.into())
+}
+
+pub async fn test_connection_handler(
+    State(app_state): State<AppState>,
+    RequireDeployment(deployment_id): RequireDeployment,
+    Path(params): Path<ConnectionParams>,
+) -> ApiResult<TestConnectionResult> {
+    let result = test_existing_connection(
+        &app_state,
+        deployment_id,
+        params.org_id,
+        params.connection_id,
+    )
+    .await?;
+    Ok(result.into())
+}

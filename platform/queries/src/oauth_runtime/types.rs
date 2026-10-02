@@ -1,0 +1,180 @@
+use models::api_key::{JwksDocument, OAuthScopeDefinition, RateLimit};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeOAuthAppData {
+    pub id: i64,
+    pub deployment_id: i64,
+    pub slug: String,
+    pub fqdn: String,
+    pub supported_scopes: Vec<String>,
+    pub scope_definitions: Vec<OAuthScopeDefinition>,
+    pub allow_dynamic_client_registration: bool,
+}
+
+impl RuntimeOAuthAppData {
+    pub fn active_scopes(&self) -> Vec<String> {
+        let mut archived = std::collections::HashSet::<String>::new();
+        for definition in &self.scope_definitions {
+            if definition.archived {
+                archived.insert(definition.scope.clone());
+            }
+        }
+
+        self.supported_scopes
+            .iter()
+            .filter(|scope| !archived.contains((*scope).as_str()))
+            .cloned()
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeDeploymentHostsData {
+    pub backend_host: String,
+    pub frontend_host: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeOAuthClientData {
+    pub id: i64,
+    pub oauth_app_id: i64,
+    pub client_id: String,
+    pub client_secret_hash: Option<String>,
+    pub client_secret_encrypted: Option<String>,
+    pub registration_access_token_hash: Option<String>,
+    pub client_auth_method: String,
+    pub grant_types: Vec<String>,
+    pub redirect_uris: Vec<String>,
+    pub token_endpoint_auth_signing_alg: Option<String>,
+    pub jwks: Option<JwksDocument>,
+    pub client_name: Option<String>,
+    pub client_uri: Option<String>,
+    pub logo_uri: Option<String>,
+    pub tos_uri: Option<String>,
+    pub policy_uri: Option<String>,
+    pub contacts: Vec<String>,
+    pub software_id: Option<String>,
+    pub software_version: Option<String>,
+    pub is_active: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// OIDC: where the RP can send the user after `/oauth/logout`. Empty Vec
+    /// when no entries are registered (i.e., RP didn't opt into OIDC logout).
+    pub post_logout_redirect_uris: Vec<String>,
+    /// OIDC: signing algorithm for id_tokens minted for this client.
+    /// Defaults to RS256 at the DB layer.
+    pub id_token_signing_alg: String,
+    /// "opaque" (default — server-side hashed lookup) or "jwt" (stateless
+    /// JWT signed by the deployment keypair; clients verify against JWKS).
+    pub access_token_format: String,
+    /// Lifetime of issued access tokens, in seconds.
+    pub access_token_ttl_seconds: i32,
+    /// If true, the consent UI is skipped and grants are auto-approved.
+    pub skip_consent: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeOAuthGrantData {
+    pub scopes: Vec<String>,
+    pub resource: String,
+    pub granted_resource: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeAuthorizationCodeData {
+    pub id: i64,
+    pub oauth_grant_id: Option<i64>,
+    pub app_slug: String,
+    pub redirect_uri: String,
+    pub pkce_code_challenge: Option<String>,
+    pub pkce_code_challenge_method: Option<String>,
+    pub scopes: Vec<String>,
+    pub resource: Option<String>,
+    pub granted_resource: Option<String>,
+    /// OIDC: nonce supplied at /authorize (echoed back in the id_token).
+    pub nonce: Option<String>,
+    /// OIDC: when the user actually authenticated. Replayed into id_token's
+    /// `auth_time` claim. Falls back to code's `created_at` if not set.
+    pub auth_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// OIDC: session id at code-issuance time. Tokens minted from this code
+    /// inherit it for cascade revocation on logout.
+    pub session_id: Option<i64>,
+    /// OIDC: user_id for the grant — used as `sub` in id_tokens. Populated by
+    /// joining `oauth_client_grants.granted_by_user_id` in the exchange query.
+    pub user_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeRefreshTokenData {
+    pub id: i64,
+    pub oauth_grant_id: Option<i64>,
+    pub app_slug: String,
+    pub replaced_by_token_id: Option<i64>,
+    pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub scopes: Vec<String>,
+    pub resource: Option<String>,
+    pub granted_resource: Option<String>,
+    /// OIDC: session linkage inherited from the original auth code. New
+    /// tokens minted via refresh-grant should carry this forward so the
+    /// logout cascade stays consistent across the chain.
+    pub session_id: Option<i64>,
+    /// Mirrors `sessions.deleted_at` from the join. None when the backing
+    /// session is still alive (or when the refresh token has no session
+    /// linkage); Some when the user has signed out and any refresh attempt
+    /// must be rejected.
+    pub session_deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub user_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeAccessTokenData {
+    pub oauth_grant_id: Option<i64>,
+    pub app_slug: String,
+    pub oauth_client_id: i64,
+    pub client_id: String,
+    pub scopes: Vec<String>,
+    pub resource: Option<String>,
+    pub granted_resource: Option<String>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeIntrospectionData {
+    pub active: bool,
+    pub oauth_grant_id: Option<i64>,
+    pub client_id: String,
+    pub app_slug: String,
+    pub scopes: Vec<String>,
+    pub resource: Option<String>,
+    pub granted_resource: Option<String>,
+    pub issued_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayOAuthAccessTokenData {
+    pub deployment_id: i64,
+    pub oauth_grant_id: Option<i64>,
+    pub oauth_client_id: i64,
+    pub client_id: String,
+    pub app_slug: String,
+    pub oauth_issuer: String,
+    pub owner_user_id: Option<i64>,
+    pub scopes: Vec<String>,
+    pub resource: Option<String>,
+    pub granted_resource: Option<String>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub rate_limits: Vec<RateLimit>,
+    pub rate_limit_scheme_slug: Option<String>,
+    pub scope_definitions: Vec<OAuthScopeDefinition>,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeOAuthGrantResolution {
+    pub active_grant_id: Option<i64>,
+    pub active: bool,
+    pub revoked: bool,
+}

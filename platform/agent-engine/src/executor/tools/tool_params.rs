@@ -1,0 +1,46 @@
+use common::error::AppError;
+use common::ResultExt;
+use dto::json::agent_executor::ToolCallRequest;
+use models::AiTool;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub(crate) const MAX_LOADED_EXTERNAL_TOOLS: usize = 15;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PlannedToolCall {
+    pub(crate) request: ToolCallRequest,
+    pub(crate) retryable_on_failure: bool,
+    #[serde(default)]
+    pub(crate) signature: Option<String>,
+    #[serde(default)]
+    pub(crate) origin_provider: String,
+    #[serde(default)]
+    pub(crate) origin_model: String,
+}
+
+impl PlannedToolCall {
+    pub(crate) fn tool_name(&self) -> &str {
+        self.request.tool_name()
+    }
+
+    pub(crate) fn input_value(&self) -> Result<Value, AppError> {
+        self.request
+            .input_value()
+            .map_err_internal("Failed to serialize tool input")
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ResolvedToolCall {
+    pub(crate) request: PlannedToolCall,
+    pub(crate) tool: AiTool,
+}
+
+pub(crate) struct ToolExecutionLoopOutcome {
+    pub any_pending: bool,
+    /// True when at least one requested tool was rejected or returned an error.
+    /// A failed batch is not forward progress and must not clear the loop's
+    /// unproductive-turn guard.
+    pub had_failure: bool,
+}
